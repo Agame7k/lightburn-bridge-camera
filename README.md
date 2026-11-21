@@ -14,12 +14,20 @@ USB camera ─▶ LightBurn Bridge (lbcam, port 8080) ─WiFi─▶ LightBurn "n
 ## Features
 
 - **MJPEG stream + snapshot URLs** that LightBurn's network camera option accepts.
-- **Web dashboard** at `http://<bridge-ip>:8080/`:
+- **Monitor page** at `http://<bridge-ip>:8080/monitor`, made to be left open (e.g. on a
+  phone or tablet next to the laser):
+  - live camera (the stream pauses while the tab is hidden, so the camera can idle)
+  - job status from the controller: running/idle, progress, elapsed time, last job's duration
+  - head position, machine counters (power-on, work and laser-on hours, job count), model
+  - laser connection: Ethernet link, whether the controller answers, LightBurn relay status
+  - Bridge health: CPU temperature, under-voltage/throttling, load
+  - reloads itself after a software update
+- **Setup page** at `http://<bridge-ip>:8080/`:
   - live preview, status, measured fps, viewer count
   - camera picker, resolution and frame rate dropdowns showing what the camera actually supports
   - image controls (exposure, focus, white balance, …), applied live and saved per camera
   - copyable URLs for LightBurn
-  - log viewer (the service journal), static IP settings
+  - log viewer (the service journal), static IP settings, software updates
 - **Handles a missing camera**: while no camera is working, LightBurn gets a
   "Camera not connected" image instead of a dead stream. Live video returns automatically
   when one is plugged in. Errors are explained in the dashboard.
@@ -159,6 +167,8 @@ sudo journalctl -u lbcam -f
 | `POST /api/network/confirm` | keep a pending change |
 | `POST /api/network/revert` | undo a pending change now |
 | `GET /api/logs?n=200` | recent log lines |
+| `GET /api/laser` | laser connection check plus controller status under `controller` (`?fresh=1` skips the 5 s cache) |
+| `GET /api/health` | Bridge CPU temperature, power/throttling flags, load, uptime |
 
 Every `POST` needs the header `X-LBCam: 1`, and an `Origin` header (if sent) must match the
 Bridge's address. That stops other websites from changing settings through your browser.
@@ -179,6 +189,9 @@ python3 lbcam_stream.py --selftest
 python3 -m unittest discover -s tests -v   # no camera needed
 python3 make_update.py                     # builds lbcam-update-<version>.tar.gz
 ```
+
+Without a laser, point the controller reader at a Ruida emulator (MeerK40t has one) with
+`LBCAM_RUIDA_DIRECT=host:port`; that skips the network namespace.
 
 GitHub Actions runs the tests on Python 3.7 (the Bridge's version) and 3.12. Pushing a tag
 `v<VERSION>` (e.g. `v2.5`) builds the update file and attaches it to a GitHub release.
@@ -207,6 +220,33 @@ GitHub Actions runs the tests on Python 3.7 (the Bridge's version) and 3.12. Pus
 | No frames from camera for 3 s | Usually power or cable. Retries automatically. |
 | Paused | Nobody is watching; it wakes on the next request. Not an error. |
 | Camera chose W×H | The camera doesn't support the requested size; pick one from the list. |
+
+| Monitor says | Fix |
+|---|---|
+| No cable | Ethernet from the Bridge to the controller is unplugged, or the laser is off. |
+| Not answering | Link is up but nothing answers at the laser IP. The controller's IP (set on the laser's panel) must match the Bridge's laser IP, 10.0.3.3 by default. |
+| Relay stopped / Relay error | LightBurn's relay service. Restart the Bridge; the message shows what it reported. |
+| Controller status: … | The status reader couldn't start or get replies; the text says why. |
+
+### How the laser status works
+
+Everything is read-only:
+
+- **Connection:** Ethernet link state, a ping to the controller (or its ARP entry if ping is
+  blocked), and LightBurn's relay status files in `/mnt/lbproc`.
+- **Controller status** (Ruida): memory reads over the controller's UDP protocol, the same
+  kind LightBurn makes constantly. The controller always replies to UDP port 40200, which
+  LightBurn's relay also uses, so the reader runs in its own network namespace (`lbcam`)
+  with its own address on the laser link (`10.0.3.254`, change with `LBCAM_RUIDA_IP`). Its
+  port 40200 is separate, so the relay never sees our traffic. Polls every 2 s while the
+  monitor is open, every 20 s otherwise. Turn it off with `LBCAM_RUIDA=0` in `/boot/lbcam.env`.
+
+The protocol details come from the open-source [MeerK40t](https://github.com/meerk40t/meerk40t)
+Ruida driver and were checked on an RDC6442G: status bit 0 = job running, bit 1 (with bit 0) =
+paused; job progress = file progress ÷ file total; the job counter only goes up for finished
+jobs, which is how "finished" and "stopped at N%" are told apart. Framing doesn't count as a
+job. Hour counters are in seconds, the controller's previous job time in milliseconds. Other
+models may differ; `/api/laser` includes the raw values under `controller.raw` for checking.
 
 Laggy or choppy: lower resolution or frame rate. Weak WiFi is the usual cause.
 

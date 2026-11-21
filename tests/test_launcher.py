@@ -2,6 +2,7 @@
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -77,14 +78,14 @@ class LauncherEndToEndTest(unittest.TestCase):
                 json.dump({"version": "2.0", "restore_previous": None}, f)
             env = dict(os.environ, LBCAM_HOME=home, CAM_PORT="1")
             launcher = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "launcher.py")
-            p = subprocess.Popen([sys.executable, launcher], env=env,
+            p = subprocess.Popen([sys.executable, launcher], env=env, start_new_session=True,
                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             try:
                 deadline = time.time() + 15
                 while time.time() < deadline and not os.path.exists(os.path.join(home, "last_update.json")):
                     time.sleep(0.2)
             finally:
-                p.kill()
+                os.killpg(p.pid, signal.SIGKILL)  # the launcher and the release it started
                 p.wait()
             with open(os.path.join(home, "last_update.json")) as f:
                 last = json.load(f)

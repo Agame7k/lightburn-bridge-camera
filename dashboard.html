@@ -18,14 +18,33 @@
   }
 }
 *{box-sizing:border-box}
+[hidden]{display:none !important}
 body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
 header{display:flex;align-items:center;gap:12px;padding:14px 20px;border-bottom:1px solid var(--line);background:var(--panel);position:sticky;top:0;z-index:2}
 header h1{font-size:16px;margin:0;font-weight:650;letter-spacing:.01em}
 header .ver{color:var(--muted);font-size:12px}
-.pill{display:inline-flex;align-items:center;gap:7px;padding:4px 10px;border-radius:999px;font-size:12px;font-weight:600;background:var(--field);border:1px solid var(--line)}
+.pill{white-space:nowrap;display:inline-flex;align-items:center;gap:7px;padding:4px 10px;border-radius:999px;font-size:12px;font-weight:600;background:var(--field);border:1px solid var(--line)}
 .dot{width:8px;height:8px;border-radius:50%;background:var(--muted)}
 .pill.ok .dot{background:var(--ok)} .pill.warn .dot{background:var(--warn)} .pill.bad .dot{background:var(--bad)}
 .spacer{flex:1}
+.tabs{display:flex;gap:2px;margin-left:8px;background:var(--field);border:1px solid var(--line);border-radius:8px;padding:2px}
+.tabs a{padding:4px 10px;border-radius:6px;color:var(--muted);text-decoration:none;font-size:13px;font-weight:600}
+.tabs a.on{background:var(--panel);color:var(--text);box-shadow:0 1px 2px rgba(0,0,0,.12)}
+a.pill{color:inherit;text-decoration:none}
+@media (max-width:560px){header .ver{display:none} header{gap:8px;padding:12px 16px} .tabs{margin-left:0}}
+@media (max-width:420px){header h1{display:none}}
+.jobhead{display:flex;align-items:baseline;justify-content:space-between;gap:12px}
+.jobstate{font-size:30px;font-weight:700;letter-spacing:-.01em}
+.jobpct{font-size:30px;font-weight:700;font-variant-numeric:tabular-nums;color:var(--accent)}
+.jobmeta{color:var(--muted);margin-top:6px;font-variant-numeric:tabular-nums}
+.bar.big{height:12px;border-radius:6px;margin-top:10px}
+.kv.big{font-size:15px}
+.jobstate.running{color:var(--ok)} .jobstate.paused{color:var(--warn)}
+.laserState{margin-bottom:6px}
+.sub{margin:14px 0 6px;font-size:11px;font-weight:650;letter-spacing:.06em;text-transform:uppercase;color:var(--muted)}
+.bar{height:6px;border-radius:3px;background:var(--field);border:1px solid var(--line);margin-top:6px;overflow:hidden}
+.bar div{height:100%;width:0;background:var(--accent);transition:width .4s}
+#laserMsg{margin:0 0 4px}
 main{display:grid;grid-template-columns:minmax(0,1fr) 360px;gap:16px;padding:16px 20px;max-width:1500px;margin:0 auto}
 @media (max-width:900px){main{grid-template-columns:1fr;padding:12px 16px}}
 .panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;box-shadow:var(--shadow)}
@@ -80,11 +99,13 @@ details.panel[open] summary h2::after{content:" ▾"}
 <body>
 <header>
   <h1>Bridge Camera</h1><span class="ver" id="ver"></span>
+  <nav class="tabs"><a href="/" id="navSetup">Setup</a><a href="/monitor" id="navMonitor">Monitor</a></nav>
   <span class="spacer"></span>
+  <a class="pill" id="laserPill" href="/monitor" title="Laser controller" hidden><span class="dot"></span><span id="laserPillText">Laser</span></a>
   <span class="pill" id="pill"><span class="dot"></span><span id="pilltext">Connecting…</span></span>
 </header>
 
-<main>
+<main id="setupView">
   <section>
     <div class="preview"><img id="preview" alt="Camera preview"><div class="overlay" id="tags"></div></div>
     <div class="banner" id="banner"></div>
@@ -208,6 +229,46 @@ details.panel[open] summary h2::after{content:" ▾"}
     </div>
   </aside>
 </main>
+<main id="monitorView" class="monitor" hidden>
+  <section>
+    <div class="preview"><img id="monPreview" alt="Live camera"><div class="overlay" id="monTags"></div></div>
+
+    <div class="panel job" style="margin-top:16px">
+      <h2>Job</h2>
+      <div class="body">
+        <div class="jobhead"><span class="jobstate" id="jobState">—</span><span class="jobpct" id="jobPct"></span></div>
+        <div class="bar big" id="jobBarWrap" hidden><div id="jobBar"></div></div>
+        <div class="jobmeta" id="jobTime"></div>
+        <dl class="kv big" id="poskv" style="margin-top:12px"></dl>
+        <div class="hint" id="ctrlNote"></div>
+      </div>
+    </div>
+  </section>
+
+  <aside class="side">
+    <div class="panel">
+      <h2>Laser connection</h2>
+      <div class="body">
+        <div class="laserState"><span class="pill" id="laserState"><span class="dot"></span><span id="laserStateText">Checking…</span></span></div>
+        <div class="hint" id="laserMsg"></div>
+        <dl class="kv" id="laserkv" style="margin-top:10px"></dl>
+        <div class="actions"><button id="laserCheck">Check now</button></div>
+      </div>
+    </div>
+
+    <div class="panel" id="ctrlWrap" hidden>
+      <h2>Machine</h2>
+      <div class="body"><dl class="kv" id="ctrlkv"></dl></div>
+    </div>
+
+    <div class="panel">
+      <h2>Bridge</h2>
+      <div class="body"><dl class="kv" id="bridgekv"></dl><dl class="kv" id="healthkv"></dl></div>
+    </div>
+
+    <div class="hint" style="padding:0 4px">Read-only: checks the Ethernet link, pings the controller and reads its status the same way LightBurn does, from a separate address so LightBurn's relay is never disturbed. Nothing on the laser is changed.</div>
+  </aside>
+</main>
 <div id="toast"></div>
 
 <script>
@@ -239,6 +300,9 @@ function startPreview(){
 async function poll(){
   try {
     state = await api("/api/state");
+    // the Bridge was updated while this page stayed open: load the new dashboard
+    if (!poll.version) poll.version = state.version;
+    else if (state.version !== poll.version && !busy) return location.reload();
     render();
   } catch(e) {
     setPill("bad", "Bridge unreachable");
@@ -266,6 +330,7 @@ function render(){
   renderBanner(s);
   renderUrls(s);
   renderStatus(s);
+  renderBridge(s);
   if (!dirty) renderCameraForm(s);
   renderControls();
 }
@@ -581,11 +646,108 @@ $("#netApply").addEventListener("click", async () => {
   } catch(e) { toast(e.message, true); btn.disabled = false; }
 });
 
-startPreview();
+/* ---------- which view: / = setup, /monitor = monitoring ---------- */
+const MONITOR = location.pathname.replace(/\/+$/, "") === "/monitor";
+$("#setupView").hidden = MONITOR;
+$("#monitorView").hidden = !MONITOR;
+$(MONITOR ? "#navMonitor" : "#navSetup").classList.add("on");
+document.title = MONITOR ? "Bridge Monitor" : "Bridge Camera";
 poll();
-loadSw();
-loadNet();
-setInterval(() => { if (!busy) loadNet(); }, 10000);
+if (MONITOR) {
+  // left open for hours: stream only while the tab is visible, so the camera can pause otherwise
+  const img = $("#monPreview");
+  const start = () => { if (document.hidden) return; img.onerror = () => setTimeout(start, 2000); img.src = "/stream?t=" + Date.now(); };
+  const stop = () => { img.onerror = null; img.removeAttribute("src"); };
+  document.addEventListener("visibilitychange", () => document.hidden ? stop() : start());
+  start();
+} else {
+  startPreview();
+  loadSw();
+  loadNet();
+  setInterval(() => { if (!busy) loadNet(); }, 10000);
+}
+
+/* ---------- laser controller ---------- */
+const LASER = {ok:["ok","Connected"], no_cable:["bad","No cable"], no_answer:["bad","Not answering"],
+               relay_down:["warn","Relay stopped"], relay_error:["warn","Relay error"], unknown:["", "Unknown"]};
+async function loadLaser(fresh){
+  let l; try { l = await api("/api/laser" + (fresh ? "?fresh=1" : "")); } catch(e) { return; }
+  const [kind, label] = LASER[l.state] || ["", l.state];
+  $("#laserState").className = "pill " + kind; $("#laserStateText").textContent = label;
+  $("#laserPill").className = "pill " + kind; $("#laserPillText").textContent = "Laser"; $("#laserPill").title = "Laser controller: " + label;
+  $("#laserPill").hidden = l.state === "unknown";
+  $("#laserMsg").textContent = l.state === "ok" ? "" : (l.message || "");
+  const yn = v => v === true ? "Yes" : v === false ? "No" : "—";
+  const ago = t => { if (!t) return "never"; const s = Math.round(Date.now()/1000 - t); return s < 5 ? "just now" : s < 120 ? s + " s ago" : Math.round(s/60) + " min ago"; };
+  const rows = [
+    ["Controller", (l.laser_ip || "—") + (l.device_type ? " (" + l.device_type + ")" : "")],
+    ["Ethernet", l.interface_found === false ? "not found" : l.cable ? "linked" + (l.speed ? " · " + l.speed + " Mb/s" : "") : "no link"],
+    ["Answers", yn(l.answers) + (l.answers ? "" : " · last seen " + ago(l.last_seen))],
+    ["Relay service", l.relay_running === null || l.relay_running === undefined ? "—" : l.relay_running ? "running" : "stopped"],
+  ];
+  if (l.relay_details && l.relay_details.message) rows.push(["Relay", l.relay_details.message]);
+  if (l.relay && l.relay.message) rows.push(["Last activity", l.relay.message]);
+  $("#laserkv").innerHTML = rows.map(([a,b]) => `<dt>${esc(a)}</dt><dd>${esc(b)}</dd>`).join("");
+  renderController(l.controller);
+}
+const dur = s => { if (s == null) return "—"; s = Math.round(s); const h = Math.floor(s/3600), m = Math.floor(s%3600/60), x = s%60;
+  return h ? `${h}h ${String(m).padStart(2,"0")}m` : m ? `${m}m ${String(x).padStart(2,"0")}s` : `${x}s`; };
+const hours = s => s == null ? "—" : (s/3600).toFixed(1) + " h";
+function renderController(c){
+  const wrap = $("#ctrlWrap"), note = $("#ctrlNote");
+  const none = msg => { wrap.hidden = true; note.textContent = msg; $("#jobState").textContent = "—"; $("#jobState").className = "jobstate";
+    $("#jobPct").textContent = ""; $("#jobBarWrap").hidden = true; $("#jobTime").textContent = ""; $("#poskv").innerHTML = ""; };
+  if (!c) return none("");
+  if (!c.available) return none("Controller status: " + (c.reason || "unavailable"));
+  wrap.hidden = false; note.textContent = "";
+  const st = {running:"Running", paused:"Paused", idle:"Idle"}[c.state] || c.state || "—";
+  $("#jobState").textContent = st;
+  $("#jobState").className = "jobstate " + (c.state || "");
+  const showPct = c.running && c.progress != null;
+  $("#jobPct").textContent = showPct ? Math.round(c.progress) + "%" : "";
+  $("#jobBarWrap").hidden = !showPct;
+  $("#jobBar").style.width = (c.progress || 0) + "%";
+  const at = t => new Date(t*1000).toLocaleTimeString([], {hour:"2-digit", minute:"2-digit"});
+  const lj = c.last_job;
+  $("#jobTime").textContent = c.running ? (c.paused ? "Paused · " : "") + "Elapsed " + dur(c.elapsed)
+    : lj && lj.result === "finished" ? "Last job finished in " + dur(lj.seconds) + " at " + at(lj.ended)
+    : lj ? "Last job stopped at " + Math.round(lj.progress) + "% after " + dur(lj.seconds) + ", " + at(lj.ended)
+    : (c.counters && c.counters.prev_work_time > 0) ? "Last job took " + dur(c.counters.prev_work_time / 1000) + " (from the controller)"
+    : "No job since the Bridge started";
+  const p = c.position || {}, k = c.counters || {};
+  const pos = ["x","y"].filter(a => p[a] != null);  // Z/U report placeholder values on machines without those axes
+  $("#poskv").innerHTML = pos.map(a => `<dt>${a.toUpperCase()}</dt><dd>${p[a].toFixed(1)} mm</dd>`).join("");
+  const rows = [
+    ["Model", c.model || "—"],
+    ["Power-on time", hours(k.open_time)],
+    ["Work time", hours(k.work_time)],
+    ["Laser on time", hours(k.laser_time)],
+    ["Jobs run", k.work_count ?? "—"],
+    ["Files stored", k.doc_count ?? "—"],
+  ];
+  $("#ctrlkv").innerHTML = rows.map(([a,b]) => `<dt>${esc(a)}</dt><dd>${esc(b)}</dd>`).join("");
+}
+async function loadHealth(){
+  let h; try { h = await api("/api/health"); } catch(e) { return; }
+  const rows = [];
+  if (h.temp_c != null) rows.push(["CPU temp", h.temp_c + " °C"]);
+  if (h.power_issues) rows.push(["Power", h.power_issues.length ? "⚠ " + h.power_issues.join(", ") : "OK"]);
+  if (h.load != null) rows.push(["CPU load", h.load.toFixed(2)]);
+  $("#healthkv").innerHTML = rows.map(([a,b]) => `<dt>${esc(a)}</dt><dd>${esc(b)}</dd>`).join("");
+}
+function renderBridge(s){
+  const cam = s.camera || {};
+  const camTxt = {streaming:"Live", idle:"Paused (no viewers)", searching:"No camera", error:"Error", starting:"Starting"}[s.state] || s.state;
+  const rows = [["Camera", camTxt + (cam.name ? " · " + cam.name : "")], ["Version", s.version],
+                ["Address", (s.hostname ? s.hostname + ".local · " : "") + (s.ips || []).join(", ")], ["Uptime", fmtUptime(s.uptime)]];
+  $("#bridgekv").innerHTML = rows.map(([a,b]) => `<dt>${esc(a)}</dt><dd>${esc(b)}</dd>`).join("");
+  const tags = s.state === "streaming" ? [`${cam.width}×${cam.height}`, `${s.fps || 0} fps`] : [camTxt];
+  $("#monTags").innerHTML = tags.map(x => `<span class="tag">${esc(x)}</span>`).join("");
+}
+if (MONITOR) { loadHealth(); setInterval(() => { if (!document.hidden) loadHealth(); }, 10000); }
+$("#laserCheck").onclick = async () => { $("#laserCheck").disabled = true; await loadLaser(true); $("#laserCheck").disabled = false; toast("Checked"); };
+loadLaser();
+setInterval(() => { if (!busy && !document.hidden) loadLaser(); }, MONITOR ? 2000 : 10000);
 
 /* ---------- log ---------- */
 async function loadLog(){
@@ -603,8 +765,10 @@ $("#logCopy").addEventListener("click", async () => {
   const t = $("#logText").textContent;
   try { await navigator.clipboard.writeText(t); toast("Log copied"); } catch(e) { toast("Select the text and copy it manually", true); }
 });
-setInterval(loadLog, 3000);
-setInterval(() => { if (!busy) loadSw(); }, 15000);
+if (!MONITOR) {
+  setInterval(loadLog, 3000);
+  setInterval(() => { if (!busy) loadSw(); }, 15000);
+}
 </script>
 </body>
 </html>

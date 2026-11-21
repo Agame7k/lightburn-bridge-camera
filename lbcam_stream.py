@@ -7,6 +7,7 @@ directly (ioctl + mmap) and passes the camera's own MJPEG frames through, so CPU
 
 Endpoints
   /                  dashboard (camera picker, resolution/fps, image controls, status)
+  /monitor           monitoring view (live camera, job, laser controller, Bridge health)
   /stream            MJPEG stream  -> LightBurn "network camera" (MJPEG)
   /snapshot[.jpg]    single JPEG   -> LightBurn "network camera" (snapshot)
   /status            short JSON status
@@ -35,6 +36,7 @@ import select
 import shutil
 import signal
 import socket
+import struct
 import subprocess
 import sys
 import tarfile
@@ -43,7 +45,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "2.6"
+VERSION = "2.9"
 LBCAM_HOME = os.environ.get("LBCAM_HOME", "/opt/lbcam")
 
 # ======================================================================== V4L2
@@ -1077,6 +1079,531 @@ class Network:
 # ======================================================================== camera
 
 
+# ---------------------------------------------------------------- laser controller check
+RELAY_LEVELS = {1: "none", 2: "ok", 3: "warn", 4: "error"}  # LightBurn's proc_status.STATUS
+
+
+class Laser:
+    """Read-only check of the link to the laser controller.
+
+    The Bridge talks to the controller over eth0 (10.0.3.1/24); LightBurn's relay
+    (lbrelay.service) forwards LightBurn's traffic to the controller's IP from
+    /boot/bridge.json. Here we only look: cable link, whether the IP answers ping/ARP,
+    and the relay's own status files. (Controller status reads are in Ruida below, from
+    a separate network namespace so the relay is never disturbed.)
+    """
+
+    CACHE_SECONDS = 5.0
+
+    def __init__(self, bridge_json="/boot/bridge.json", iface="eth0", proc_dir="/mnt/lbproc",
+                 sys_net="/sys/class/net"):
+        self.bridge_json, self.iface, self.proc_dir, self.sys_net = bridge_json, iface, proc_dir, sys_net
+        self.lock = threading.Lock()
+        self.cached, self.cached_at = None, 0.0
+        self.last_seen = None  # time the controller last answered
+
+    # ---- pieces (replaced in tests)
+    def bridge_config(self):
+        try:
+            with open(self.bridge_json) as f:
+                d = json.load(f)
+            return {"laser_ip": str(d.get("laser_ip") or "10.0.3.3"),
+                    "device_type": str(d.get("device_type") or "ruida"), "found": True}
+        except (OSError, ValueError, AttributeError):
+            return {"laser_ip": "10.0.3.3", "device_type": "ruida", "found": False}
+
+    def _sys(self, name):
+        try:
+            with open(os.path.join(self.sys_net, self.iface, name)) as f:
+                return f.read().strip()
+        except OSError:
+            return None
+
+    def link(self):
+        """(exists, cable_up, speed_mbps)."""
+        if not os.path.isdir(os.path.join(self.sys_net, self.iface)):
+            return False, False, None
+        up = self._sys("carrier") == "1"
+        speed = self._sys("speed") if up else None
+        try:
+            speed = int(speed) if speed and int(speed) > 0 else None
+        except ValueError:
+            speed = None
+        return True, up, speed
+
+    def ping(self, ip):
+        try:
+            r = subprocess.run(["ping", "-c", "1", "-W", "1", "-I", self.iface, ip],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3)
+            return r.returncode == 0
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+
+    def arp(self, ip):
+        """True if the kernel has a complete ARP entry for ip (answers even with ping blocked)."""
+        try:
+            with open("/proc/net/arp") as f:
+                for line in f.readlines()[1:]:
+                    p = line.split()
+                    if len(p) >= 6 and p[0] == ip and p[5] == self.iface and int(p[2], 16) & 0x2:
+                        return True
+        except (OSError, ValueError):
+            pass
+        return False
+
+    def relay_running(self):
+        try:
+            r = subprocess.run(["systemctl", "is-active", "--quiet", "lbrelay"], timeout=5)
+            return r.returncode == 0
+        except (OSError, subprocess.TimeoutExpired):
+            return None  # unknown (not a Bridge)
+
+    def relay_status(self, name):
+        """LightBurn's /mnt/lbproc/<name>.status: level on line 1, message after."""
+        try:
+            with open(os.path.join(self.proc_dir, name + ".status")) as f:
+                lines = f.read().splitlines()
+        except OSError:
+            return None
+        if not lines:
+            return None
+        try:
+            level = RELAY_LEVELS.get(int(lines[0].strip()), "none")
+            msg = "\n".join(lines[1:]).strip()
+        except ValueError:
+            level, msg = "none", "\n".join(lines).strip()
+        return {"level": level, "message": msg[:300]}
+
+    # ---- summary
+    def check(self, fresh=False):
+        with self.lock:
+            if not fresh and self.cached and time.time() - self.cached_at < self.CACHE_SECONDS:
+                return self.cached
+            r = self._check()
+            self.cached, self.cached_at = r, time.time()
+            return r
+
+    def _check(self):
+        cfg = self.bridge_config()
+        ip = cfg["laser_ip"]
+        exists, cable, speed = self.link()
+        answers = bool(cable and (self.ping(ip) or self.arp(ip)))
+        if answers:
+            self.last_seen = time.time()
+        running = self.relay_running()
+        relay = self.relay_status("relay")
+        details = self.relay_status("relay_details")
+        r = {"laser_ip": ip, "device_type": cfg["device_type"], "bridge_config": cfg["found"],
+             "interface": self.iface, "interface_found": exists, "cable": cable, "speed": speed,
+             "answers": answers, "last_seen": self.last_seen,
+             "relay_running": running, "relay": relay, "relay_details": details}
+        if not exists:
+            r["state"], r["message"] = "unknown", "No %s interface on this device" % self.iface
+        elif not cable:
+            r["state"], r["message"] = "no_cable", \
+                "No Ethernet link: check the cable from the Bridge to the laser and that the laser is on"
+        elif not answers:
+            r["state"], r["message"] = "no_answer", \
+                ("Cable connected, but nothing answers at %s. Check the controller's IP is %s "
+                 "(set on the laser's panel) or change it in the LightBurn Bridge settings" % (ip, ip))
+        elif running is False:
+            r["state"], r["message"] = "relay_down", \
+                "Controller found at %s, but LightBurn's relay service isn't running" % ip
+        elif any(x and x["level"] == "error" for x in (relay, details)):
+            bad = relay if relay and relay["level"] == "error" else details
+            r["state"], r["message"] = "relay_error", "Controller found; relay reports: " + bad["message"]
+        else:
+            r["state"], r["message"] = "ok", "Controller found at %s" % ip
+        return r
+
+
+# ---------------------------------------------------------------- Ruida controller status (read-only)
+# Protocol per the open-source MeerK40t driver: UDP to controller:50200, replies always go to
+# port 40200. Every byte is "swizzled" with a model-specific magic key; requests carry a 16-bit
+# checksum of the swizzled bytes. Memory reads: DA 00 <addr:2x7bit> -> DA 01 <addr> <value:5x7bit>.
+RUIDA_PORT, RUIDA_REPLY_PORT = 50200, 40200
+RUIDA_MAGICS = (0x88, 0x11, 0x38)  # 644x/654x/320, 634x, RDL9635
+RUIDA_MODELS = {0x65106510: "RDC6442S", 0x65006500: "RDC6442G"}
+MEM = {  # address -> key (addresses are 14-bit: byte pair hi*128+lo)
+    0x0200: "status", 0x0221: "x", 0x0231: "y", 0x0241: "z", 0x0251: "u",
+    0x0201: "open_time", 0x0202: "work_time", 0x0203: "work_count", 0x0205: "doc_count",
+    0x0208: "prev_work_time", 0x0211: "laser_time", 0x0320: "file_total", 0x0321: "file_progress",
+    0x02FE: "card_id",
+}
+MEM_FAST = (0x0200, 0x0221, 0x0231, 0x0241, 0x0251, 0x0320, 0x0321, 0x0203, 0x0208)
+MEM_SLOW = (0x0201, 0x0202, 0x0205, 0x0211, 0x02FE)
+# Status bits as seen on an RDC6442G: bit 0 = job running, bit 1 (with bit 0) = paused.
+# (MeerK40t names bit 1 "part end"; on real hardware it is set exactly while paused.)
+STATUS_JOB_RUNNING, STATUS_PAUSED = 0x01, 0x02
+FILE_TOTAL_UNKNOWN = 1000000000  # reported while framing / no job loaded
+
+
+def _swz(b, m):
+    b ^= (b >> 7) & 0xFF
+    b ^= (b << 7) & 0xFF
+    b ^= (b >> 7) & 0xFF
+    b ^= m
+    return (b + 1) & 0xFF
+
+
+def _unswz(b, m):
+    b = (b - 1) & 0xFF
+    b ^= m
+    b ^= (b >> 7) & 0xFF
+    b ^= (b << 7) & 0xFF
+    b ^= (b >> 7) & 0xFF
+    return b
+
+
+_SWZ = {m: bytes(_swz(b, m) for b in range(256)) for m in RUIDA_MAGICS}
+_UNSWZ = {m: bytes(_unswz(b, m) for b in range(256)) for m in RUIDA_MAGICS}
+
+
+def ruida_swizzle(data, magic):
+    return bytes(data).translate(_SWZ[magic])
+
+
+def ruida_unswizzle(data, magic):
+    return bytes(data).translate(_UNSWZ[magic])
+
+
+def ruida_packet(payload, magic):
+    sw = ruida_swizzle(payload, magic)
+    return struct.pack(">H", sum(sw) & 0xFFFF) + sw
+
+
+def ruida_read_request(addr):
+    return bytes((0xDA, 0x00, (addr >> 7) & 0x7F, addr & 0x7F))
+
+
+def decode35(b, signed=True):
+    v = 0
+    for x in b[:5]:
+        v = (v << 7) | (x & 0x7F)
+    if signed and v & (1 << 34):
+        v -= 1 << 35
+    return v
+
+
+def encode35(v):
+    v &= (1 << 35) - 1
+    return bytes((v >> s) & 0x7F for s in (28, 21, 14, 7, 0))
+
+
+def ruida_parse_reply(data, magic):
+    """(addr, value) from a memory-read reply, or None."""
+    d = ruida_unswizzle(data, magic)
+    if len(d) >= 9 and d[0] == 0xDA and d[1] == 0x01:
+        return ((d[2] & 0x7F) << 7) | (d[3] & 0x7F), decode35(d[4:9])
+    return None
+
+
+class RuidaUDP:
+    """Request/reply over UDP. bind=(host, 40200) inside our own network namespace."""
+
+    def __init__(self, laser_ip, bind=("", RUIDA_REPLY_PORT), port=RUIDA_PORT, timeout=0.3):
+        self.addr = (laser_ip, port)
+        self.timeout = timeout
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.bind(bind)
+
+    def close(self):
+        self.sock.close()
+
+    def read(self, addr, magic):
+        req = ruida_read_request(addr)
+        try:
+            while True:  # drop anything stale
+                self.sock.setblocking(False)
+                self.sock.recv(2048)
+        except (BlockingIOError, InterruptedError):
+            pass
+        except OSError:
+            pass
+        self.sock.settimeout(self.timeout)
+        for _ in range(2):
+            self.sock.sendto(ruida_packet(req, magic), self.addr)
+            end = time.time() + self.timeout
+            while time.time() < end:
+                try:
+                    self.sock.settimeout(max(0.01, end - time.time()))
+                    data, src = self.sock.recvfrom(2048)
+                except socket.timeout:
+                    break
+                if src[0] != self.addr[0]:
+                    continue
+                r = ruida_parse_reply(data, magic)
+                if r and r[0] == addr:
+                    return r[1]
+        return None
+
+
+class NetNS:
+    """Our own network namespace with a macvlan on eth0, so we can use port 40200
+    without touching the one LightBurn's relay listens on."""
+
+    CLONE_NEWNET = 0x40000000
+
+    def __init__(self, name="lbcam", parent="eth0", link="lbcamlaser"):
+        self.name, self.parent, self.link = name, parent, link
+        self.ip = None
+
+    def _ip(self, *args, check=True):
+        r = subprocess.run(["ip"] + list(args), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           universal_newlines=True, timeout=10)
+        if check and r.returncode != 0:
+            raise OSError((r.stderr or r.stdout).strip() or "ip %s failed" % " ".join(args))
+        return r.stdout
+
+    def setup(self, laser_ip):
+        if os.geteuid() != 0:
+            raise OSError("needs root")
+        prefix = ".".join(laser_ip.split(".")[:3])
+        want = os.environ.get("LBCAM_RUIDA_IP") or prefix + ".254"
+        if self.name not in self._ip("netns", "list", check=False).split():
+            self._ip("netns", "add", self.name)
+        ns = ["netns", "exec", self.name, "ip"]
+        have = subprocess.run(["ip"] + ns + ["-o", "-4", "addr", "show", "dev", self.link],
+                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, universal_newlines=True).stdout
+        if want + "/" not in have:
+            subprocess.run(["ip"] + ns + ["link", "del", self.link], stderr=subprocess.DEVNULL)
+            # created straight into the namespace so NetworkManager never sees it
+            self._ip("link", "add", self.link, "link", self.parent, "netns", self.name, "type", "macvlan", "mode", "bridge")
+            self._ip("netns", "exec", self.name, "ip", "addr", "add", want + "/24", "dev", self.link)
+            self._ip("netns", "exec", self.name, "ip", "link", "set", self.link, "up")
+            self._ip("netns", "exec", self.name, "ip", "link", "set", "lo", "up")
+        self.ip = want
+
+    home_fd = None
+
+    def _setns(self, fd):
+        libc = ctypes.CDLL(None, use_errno=True)
+        if libc.setns(fd, self.CLONE_NEWNET) != 0:
+            raise OSError(ctypes.get_errno(), "setns failed")
+
+    def enter(self):
+        """Move the calling thread (only) into the namespace."""
+        if self.home_fd is None:
+            self.home_fd = os.open("/proc/thread-self/ns/net", os.O_RDONLY)
+        fd = os.open("/var/run/netns/" + self.name, os.O_RDONLY)
+        try:
+            self._setns(fd)
+        finally:
+            os.close(fd)
+
+    def leave(self):
+        """Back to the normal namespace (needed to see eth0 when re-creating the link)."""
+        if self.home_fd is not None:
+            self._setns(self.home_fd)
+
+
+class Ruida:
+    """Polls the controller's status in the background (read-only memory reads)."""
+
+    def __init__(self, laser, enabled=None, transport_factory=None):
+        self.laser = laser
+        self.enabled = (os.environ.get("LBCAM_RUIDA", "1") != "0") if enabled is None else enabled
+        self.transport_factory = transport_factory  # tests: (laser_ip) -> transport
+        self.lock = threading.Lock()
+        self.wanted_until = 0.0
+        self.wake = threading.Event()
+        self.state = {"available": False, "reason": "starting" if self.enabled else "turned off (LBCAM_RUIDA=0)"}
+        self.values, self.raw = {}, {}
+        self.magic = None
+        self.job = None       # the run in progress: {"start", "count0", "progress"}
+        self.last_job = None  # {"seconds", "ended", "result": finished|stopped, "progress"}
+        self.recheck_until = 0.0
+        self.updated = None
+        self.ns = None
+
+    def want(self):
+        """The dashboard is looking: poll fast for a while."""
+        self.wanted_until = time.time() + 30
+        self.wake.set()
+
+    def start(self):
+        if self.enabled:
+            threading.Thread(target=self.run, daemon=True).start()
+
+    # ---- polling
+    def _transport(self, laser_ip):
+        if self.transport_factory:
+            return self.transport_factory(laser_ip)
+        direct = os.environ.get("LBCAM_RUIDA_DIRECT")  # development: host:port of an emulator
+        if direct:
+            host, _, port = direct.rpartition(":")
+            return RuidaUDP(host, bind=("", 0), port=int(port))
+        if self.ns is None:
+            self.ns = NetNS(parent=self.laser.iface)
+        self.ns.leave()
+        self.ns.setup(laser_ip)
+        self.ns.enter()  # this thread lives in the namespace from now on
+        return RuidaUDP(laser_ip)
+
+    def run(self):
+        transport, laser_ip, fails, slow_at = None, None, 0, 0.0
+        while True:
+            ip = self.laser.bridge_config()["laser_ip"]
+            try:
+                if transport is None or ip != laser_ip:
+                    if transport:
+                        transport.close()
+                    transport, laser_ip, self.magic = self._transport(ip), ip, None
+                link = self.laser.link()[1]
+                if not link:
+                    self._set(False, "no Ethernet link")
+                elif self.poll_once(transport, slow=time.time() >= slow_at):
+                    fails = 0
+                    if time.time() >= slow_at:
+                        slow_at = time.time() + 60
+                else:
+                    fails += 1
+                    self._set(False, "controller doesn't answer status reads" if self.magic is None
+                              else "no reply from controller")
+                    if fails >= 3:
+                        self.magic = None
+            except Exception as e:  # setup problems: report and retry later
+                transport = None
+                self._set(False, "can't open a reader: %s" % e)
+                self.wake.wait(60)
+                self.wake.clear()
+                continue
+            fast = time.time() < self.wanted_until or self._running()
+            self.wake.wait(2 if fast else 20)
+            self.wake.clear()
+
+    def _detect_magic(self, t):
+        for m in ((self.magic,) if self.magic else RUIDA_MAGICS):
+            v = t.read(0x02FE, m)
+            if v is not None:
+                return m, v
+        return None, None
+
+    def poll_once(self, t, slow=True):
+        if self.magic is None:
+            m, card = self._detect_magic(t)
+            if m is None:
+                return False
+            self.magic = m
+            self.raw["card_id"] = card
+            slow = True
+        got = {}
+        for addr in MEM_FAST + (MEM_SLOW if slow else ()):
+            v = t.read(addr, self.magic)
+            if v is None and addr == 0x0200:
+                return False
+            if v is not None:
+                got[MEM[addr]] = v
+        with self.lock:
+            self.raw.update(got)
+            self._interpret()
+            self.updated = time.time()
+            self.state = {"available": True, "reason": ""}
+        return True
+
+    def _set(self, ok, reason):
+        with self.lock:
+            self.state = {"available": ok, "reason": reason}
+
+    def _running(self):
+        return bool(self.values.get("running"))
+
+    @property
+    def job_started(self):
+        return self.job["start"] if self.job else None
+
+    def _interpret(self):
+        r, v, now = self.raw, {}, time.time()
+        tot, prog = r.get("file_total"), r.get("file_progress")
+        progress = (round(100.0 * prog / tot, 1)
+                    if tot and 0 < tot < FILE_TOTAL_UNKNOWN and prog is not None and 0 <= prog <= tot else None)
+        count = r.get("work_count")
+        st = r.get("status")
+        if st is not None:
+            running = bool(st & STATUS_JOB_RUNNING)
+            paused = running and bool(st & STATUS_PAUSED)
+            v["running"], v["paused"] = running, paused
+            v["state"] = "paused" if paused else "running" if running else "idle"
+            if running:
+                if not self.job:
+                    self.job = {"start": now, "count0": count, "progress": None}
+                if progress is not None:
+                    self.job["progress"] = progress
+            elif self.job:
+                self._job_ended(self.job, now, count)
+                self.job = None
+        # the job counter can tick up a moment after the status goes idle
+        lj = self.last_job
+        if lj and lj["result"] == "stopped" and now < self.recheck_until and self._counted(lj.get("count0"), count):
+            lj["result"], lj["progress"] = "finished", 100.0
+        v["elapsed"] = round(now - self.job["start"]) if self.job else None
+        v["progress"] = progress if self.job else None
+        v["position"] = {k: round(r[k] / 1000.0, 2) for k in ("x", "y", "z", "u") if k in r}
+        v["counters"] = {k: r[k] for k in ("open_time", "work_time", "laser_time", "work_count",
+                                             "doc_count", "prev_work_time") if k in r}
+        cid = r.get("card_id")
+        if cid is not None:
+            v["model"] = RUIDA_MODELS.get(cid & 0xFFFFFFFF, "Ruida (card %08X)" % (cid & 0xFFFFFFFF))
+        self.values = v
+
+    @staticmethod
+    def _counted(before, after):
+        return before is not None and after is not None and after > before
+
+    def _job_ended(self, job, now, count):
+        last = job["progress"]
+        if self._counted(job["count0"], count) or (last is not None and last >= 98):
+            result = "finished"
+        elif last is None:
+            return  # no job file progress at all: framing or a move, not a job
+        else:
+            result = "stopped"
+        self.last_job = {"seconds": round(now - job["start"]), "ended": now, "result": result,
+                         "progress": 100.0 if result == "finished" else last, "count0": job["count0"]}
+        self.recheck_until = now + 15
+        log("laser job %s after %ds%s" % (result, self.last_job["seconds"],
+                                          "" if result == "finished" else " at %.0f%%" % last))
+
+    def status(self):
+        with self.lock:
+            out = dict(self.state)
+            out.update(self.values)
+            out["last_job"] = self.last_job
+            out["updated"] = self.updated
+            out["magic"] = "0x%02X" % self.magic if self.magic else None
+            out["raw"] = dict(self.raw)
+            return out
+
+
+def pi_health():
+    """CPU temperature and Raspberry Pi power/throttling flags."""
+    h = {}
+    try:
+        with open("/sys/class/thermal/thermal_zone0/temp") as f:
+            h["temp_c"] = round(int(f.read().strip()) / 1000.0, 1)
+    except (OSError, ValueError):
+        pass
+    try:
+        out = subprocess.run(["vcgencmd", "get_throttled"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                             universal_newlines=True, timeout=3).stdout
+        bits = int(out.strip().split("=")[1], 16)
+        h["throttled"] = bits
+        names = {0: "under-voltage now", 1: "CPU speed capped now", 2: "throttled now", 3: "hot now",
+                 16: "under-voltage since boot", 17: "speed capped since boot", 18: "throttled since boot",
+                 19: "hot since boot"}
+        h["power_issues"] = [n for b, n in names.items() if bits & (1 << b)]
+    except (OSError, ValueError, IndexError, subprocess.TimeoutExpired):
+        pass
+    try:
+        with open("/proc/loadavg") as f:
+            h["load"] = float(f.read().split()[0])
+        with open("/proc/uptime") as f:
+            h["uptime"] = int(float(f.read().split()[0]))
+    except (OSError, ValueError):
+        pass
+    return h
+
+
 class Camera:
     """Owns the capture device. Publishes live frames, or the placeholder when no camera is usable."""
 
@@ -1441,7 +1968,9 @@ def host_allowed(host_header, extra=None):
     return h in allowed or h.endswith(".local")
 
 
-def make_handler(cam, cfg, dashboard, updater, net=None):
+def make_handler(cam, cfg, dashboard, updater, net=None, laser=None, ruida=None):
+    health_cache = {"t": 0.0, "v": {}}
+
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.0"
         server_version = "lbcam/" + VERSION
@@ -1503,7 +2032,7 @@ def make_handler(cam, cfg, dashboard, updater, net=None):
                 return self._send(403, "text/plain", err.encode(), head)
             u = urlparse(self.path)
             p = u.path.rstrip("/") or "/"
-            if p in ("/", "/index.html"):
+            if p in ("/", "/index.html", "/monitor"):  # one page, two views
                 return self._send(200, "text/html; charset=utf-8", dashboard, head)
             if p in ("/stream", "/stream.mjpg", "/video", "/mjpeg"):
                 if head:
@@ -1531,6 +2060,18 @@ def make_handler(cam, cfg, dashboard, updater, net=None):
                 return self._json(updater.info())
             if p == "/api/network":
                 return self._json(net.info() if net else {"available": False, "error": "disabled"})
+            if p == "/api/laser":
+                if not laser:
+                    return self._json({"state": "unknown", "message": "Laser check not available"})
+                out = dict(laser.check(fresh="fresh" in parse_qs(u.query)))
+                if ruida:
+                    ruida.want()
+                    out["controller"] = ruida.status()
+                return self._json(out)
+            if p == "/api/health":
+                if time.time() - health_cache["t"] > 5:
+                    health_cache["v"], health_cache["t"] = pi_health(), time.time()
+                return self._json(health_cache["v"])
             if p == "/api/logs":
                 try:
                     n = int((parse_qs(u.query).get("n") or ["300"])[0])
@@ -1718,12 +2259,15 @@ def main():
     cam = Camera(cfg, placeholder)
     updater = Updater(cfg)
     net = Network()
+    laser = Laser(iface=os.environ.get("LBCAM_LASER_IFACE", "eth0"))
+    ruida = Ruida(laser)
+    ruida.start()
     threading.Thread(target=cam.run, daemon=True).start()
 
     srv = None
     for attempt in range(30):
         try:
-            srv = ThreadingHTTPServer(("0.0.0.0", port), make_handler(cam, cfg, dashboard, updater, net))
+            srv = ThreadingHTTPServer(("0.0.0.0", port), make_handler(cam, cfg, dashboard, updater, net, laser, ruida))
             break
         except OSError as e:
             log("port %d unavailable (%s), retrying..." % (port, e))

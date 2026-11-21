@@ -62,6 +62,7 @@ button:disabled{opacity:.5;cursor:default}
 .ctrl select{margin-top:6px}
 .switch{display:flex;align-items:center;gap:8px;cursor:pointer}
 .kv{display:grid;grid-template-columns:auto 1fr;gap:4px 12px;font-size:13px}
+.kv dd.hash{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11px;user-select:all}
 .kv dt{color:var(--muted)} .kv dd{margin:0;overflow-wrap:anywhere;font-variant-numeric:tabular-nums}
 .url{display:flex;gap:6px;margin-top:6px}
 .url input{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}
@@ -448,7 +449,8 @@ async function loadSw(){
   let u; try { u = await api("/api/update"); } catch(e) { return; }
   const when = t => t ? new Date(t * 1000).toLocaleString() : "";
   $("#swkv").innerHTML = [["Version", u.version], ["Previous", u.previous || "—"]]
-    .map(([a,b]) => `<dt>${esc(a)}</dt><dd>${esc(b)}</dd>`).join("");
+    .map(([a,b]) => `<dt>${esc(a)}</dt><dd>${esc(b)}</dd>`).join("")
+    + `<dt>File SHA-256</dt><dd class="hash" title="SHA-256 of the update file this version was installed from. Compare it with the .sha256 file next to the update.">${u.sha256 ? esc(u.sha256) : "—"}</dd>`;
   const last = $("#swlast"), lu = u.last_update;
   if (lu && lu.result === "rolled_back") {
     last.className = "banner show bad";

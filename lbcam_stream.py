@@ -43,7 +43,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "2.5"
+VERSION = "2.6"
 LBCAM_HOME = os.environ.get("LBCAM_HOME", "/opt/lbcam")
 
 # ======================================================================== V4L2
@@ -644,17 +644,30 @@ class Updater:
             "managed": self.managed(),
             "previous": self._link_version("previous") if self.managed() else None,
             "password_set": self.password_set(),
+            "sha256": self._package_sha256(),
             "last_update": last,
             "home": self.home,
         }
 
+    def _package_sha256(self):
+        """SHA-256 of the update file the running release was installed from (None if unknown)."""
+        try:
+            with open(os.path.join(self.home, "current", "manifest.json")) as f:
+                return json.load(f).get("package_sha256")
+        except (OSError, ValueError, AttributeError):
+            return None
+
     # ------------------------------------------------------------ install
-    def install(self, blob, pw):
+    def install(self, blob, pw, expect_sha256=None):
         self.check_password(pw)
         if not self.managed():
             raise UpdateError("This install can't self-update (not running under the lbcam launcher)")
+        digest = hashlib.sha256(blob).hexdigest()
+        if expect_sha256 and expect_sha256.strip().lower() != digest:
+            raise UpdateError("Update file SHA-256 doesn't match (got %s)" % digest)
         with self.lock:
             files, manifest = self._unpack(blob)
+            manifest["package_sha256"] = digest
             version = manifest["version"]
             if version == VERSION:
                 raise UpdateError("Version %s is already running" % version)
@@ -1603,15 +1616,16 @@ def make_handler(cam, cfg, dashboard, updater, net=None):
             if len(blob) != n:
                 return self._json({"error": "upload was cut off"}, 400)
             try:
-                v = updater.install(blob, self.headers.get("X-Password"))
+                v = updater.install(blob, self.headers.get("X-Password"), self.headers.get("X-Sha256"))
             except PermissionError as e:
                 return self._json({"error": str(e)}, 403)
             except UpdateError as e:
                 return self._json({"error": str(e)}, 400)
             except OSError as e:
                 return self._json({"error": "could not install: %s" % e}, 500)
-            log("installed update", v)
-            self._json({"ok": True, "version": v, "restarting": True})
+            digest = hashlib.sha256(blob).hexdigest()
+            log("installed update", v, "sha256", digest)
+            self._json({"ok": True, "version": v, "sha256": digest, "restarting": True})
 
         # ---------------------------------------------------- payloads
         def _status(self):

@@ -91,8 +91,18 @@ laser's Ethernet link isn't touched.
 ## Updating
 
 1. Change the code and bump `VERSION` in `lbcam_stream.py`.
-2. `python3 make_update.py` → `lbcam-update-<version>.tar.gz`
+2. `python3 make_update.py` → `lbcam-update-<version>.tar.gz` plus
+   `lbcam-update-<version>.tar.gz.sha256` (the file's SHA-256, `sha256sum` format).
 3. Dashboard → **Software** → choose the file → **Install update**.
+4. Optional: compare **Software → File SHA-256** with the `.sha256` file to confirm the
+   Bridge got exactly the file you built (`sha256sum -c lbcam-update-*.sha256` checks your copy).
+
+From a script, send the expected hash and the Bridge refuses the file if it doesn't match:
+
+```
+curl -X POST -H 'X-LBCam: 1' -H "X-Sha256: $(cut -d' ' -f1 lbcam-update-2.6.tar.gz.sha256)" \
+     --data-binary @lbcam-update-2.6.tar.gz http://lightburnbridge.local:8080/api/update
+```
 
 What happens:
 
@@ -140,8 +150,8 @@ sudo journalctl -u lbcam -f
 | `POST /api/control` | `{"id","value"}` |
 | `POST /api/controls/reset` | camera defaults, clears saved values |
 | `POST /api/restart` | reopen the camera |
-| `GET /api/update` | version, previous version, last update result |
-| `POST /api/update` | update file as the body (`X-Password` header if a password is set) |
+| `GET /api/update` | version, previous version, installed file's SHA-256, last update result |
+| `POST /api/update` | update file as the body (`X-Password` if a password is set, optional `X-Sha256`) |
 | `POST /api/update/rollback` | `{"password"}` |
 | `POST /api/update/password` | `{"current","new"}`. An empty `new` removes the password |
 | `GET /api/network` | WiFi connection, address, mode, pending change |

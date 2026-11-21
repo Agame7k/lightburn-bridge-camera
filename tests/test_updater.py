@@ -59,6 +59,19 @@ class UpdaterTest(unittest.TestCase):
         self.upd.install(package(files, "9.3"), None)
         self.assertTrue(os.path.isfile(os.path.join(self.home, "releases", "9.3", "dashboard.html")))
 
+    def test_records_package_sha256(self):
+        import hashlib
+        blob = package(app_sources("9.1"), "9.1")
+        self.assertIsNone(self.upd.info()["sha256"])
+        self.upd.install(blob, None, hashlib.sha256(blob).hexdigest().upper())  # case-insensitive
+        self.assertEqual(self.upd.info()["sha256"], hashlib.sha256(blob).hexdigest())
+
+    def test_rejects_wrong_expected_sha256(self):
+        with self.assertRaises(app.UpdateError) as cm:
+            self.upd.install(package(app_sources("9.1"), "9.1"), None, "0" * 64)
+        self.assertIn("SHA-256", str(cm.exception))
+        self.assertEqual(self.link("current"), "releases/" + app.VERSION)
+
     # ---------------------------------------------------------------- rejected uploads
     def assertRejected(self, blob, msg):
         with self.assertRaises(app.UpdateError) as cm:

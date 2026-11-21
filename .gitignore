@@ -11,6 +11,7 @@ lbcam.json.tmp
 *.img.xz
 *.zip
 lbcam-update-*.tar.gz
+lbcam-update-*.tar.gz.sha256
 
 # OS / editor
 .DS_Store

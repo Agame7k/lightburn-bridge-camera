@@ -3,6 +3,10 @@
 Build an update file for the Bridge camera dashboard.
 
   python3 make_update.py            -> lbcam-update-<version>.tar.gz
+                                       lbcam-update-<version>.tar.gz.sha256
+
+The .sha256 file is in `sha256sum` format (check it with `sha256sum -c`). After installing,
+the dashboard (Software -> File SHA-256) shows the hash of the file the Bridge received.
 
 Upload it on the Bridge at http://<bridge-ip>:8080 -> Software -> Install update.
 The version comes from VERSION in lbcam_stream.py - bump it for every update.
@@ -47,7 +51,12 @@ def main():
             info.mtime = int(time.time())
             info.mode = 0o644
             tf.addfile(info, io.BytesIO(blobs[name]))
+    with open(out, "rb") as f:
+        digest = hashlib.sha256(f.read()).hexdigest()
+    with open(out + ".sha256", "w") as f:
+        f.write("%s  %s\n" % (digest, os.path.basename(out)))
     print("built", out, "(%d KB)" % (os.path.getsize(out) // 1024))
+    print("sha256", digest)
 
 
 if __name__ == "__main__":

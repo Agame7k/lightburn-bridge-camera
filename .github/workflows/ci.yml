@@ -22,7 +22,7 @@ jobs:
       - name: Unit tests
         run: python -m unittest discover -s tests -v
       - name: Build update package
-        run: python make_update.py
+        run: python make_update.py && sha256sum -c lbcam-update-*.tar.gz.sha256
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')
@@ -42,4 +42,4 @@ jobs:
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" "lbcam-update-$VERSION.tar.gz" --title "$GITHUB_REF_NAME" --generate-notes
+        run: gh release create "$GITHUB_REF_NAME" "lbcam-update-$VERSION.tar.gz" "lbcam-update-$VERSION.tar.gz.sha256" --title "$GITHUB_REF_NAME" --generate-notes

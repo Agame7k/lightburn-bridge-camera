@@ -21,7 +21,15 @@ USB camera ─▶ LightBurn Bridge (lbcam, port 8080) ─WiFi─▶ LightBurn "n
   - head position, machine counters (power-on, work and laser-on hours, job count), model
   - laser connection: Ethernet link, whether the controller answers, LightBurn relay status
   - Bridge health: CPU temperature, under-voltage/throttling, load
+  - laser buttons: **Pause / Resume / Stop** during a job
+  - **"Laser isn't firing" warning** when a job has run 20 s without the laser-on counter
+    moving: usually an alarm on the panel such as Water Prot (the water alarm itself can't be
+    read from the controller)
   - reloads itself after a software update
+- **Alerts on the page** (setup and monitor): job started / paused / resumed / finished /
+  stopped at N%, laser disconnected / connected, camera unplugged / plugged in, Bridge hot or
+  under-voltage. Important ones stay until dismissed; a hidden tab shows a count in its title.
+  Optional sound (bell button in the header).
 - **Setup page** at `http://<bridge-ip>:8080/`:
   - live preview, status, measured fps, viewer count
   - camera picker, resolution and frame rate dropdowns showing what the camera actually supports
@@ -169,6 +177,8 @@ sudo journalctl -u lbcam -f
 | `GET /api/logs?n=200` | recent log lines |
 | `GET /api/laser` | laser connection check plus controller status under `controller` (`?fresh=1` skips the 5 s cache) |
 | `GET /api/health` | Bridge CPU temperature, power/throttling flags, load, uptime |
+| `GET /api/laser/scan?start=0x200&count=256` | diagnostic: read a range of controller memory (idle only, read-only) |
+| `POST /api/laser/command` | `{"cmd": "pause" \| "resume" \| "stop"}` |
 
 Every `POST` needs the header `X-LBCam: 1`, and an `Origin` header (if sent) must match the
 Bridge's address. That stops other websites from changing settings through your browser.
@@ -228,9 +238,26 @@ GitHub Actions runs the tests on Python 3.7 (the Bridge's version) and 3.12. Pus
 | Relay stopped / Relay error | LightBurn's relay service. Restart the Bridge; the message shows what it reported. |
 | Controller status: … | The status reader couldn't start or get replies; the text says why. |
 
+### Laser buttons
+
+| Button | Sends | Allowed when |
+|---|---|---|
+| Pause | `D8 02` | a job is running |
+| Resume | `D8 03` | a job is paused |
+| Stop | `D8 01` | a job is running or paused (asks first) |
+
+All three are verified on an RDC6442G. Two others were tried and removed: `D8 2A`
+("Home XY" in MeerK40t) **reset the controller** (it rebooted and re-homed), and the panel's
+Frame key (`A5 53 00`) was acknowledged but ignored on port 50200.
+
+The Bridge enforces these rules itself, not just the page. Each command waits for the
+controller's acknowledgement and is never resent if none arrives, so it can't run twice.
+Every command is logged with the address it came from. There is deliberately no way to
+start a job or fire the laser from the Bridge.
+
 ### How the laser status works
 
-Everything is read-only:
+Status reading is read-only:
 
 - **Connection:** Ethernet link state, a ping to the controller (or its ARP entry if ping is
   blocked), and LightBurn's relay status files in `/mnt/lbproc`.
@@ -244,8 +271,9 @@ Everything is read-only:
 The protocol details come from the open-source [MeerK40t](https://github.com/meerk40t/meerk40t)
 Ruida driver and were checked on an RDC6442G: status bit 0 = job running, bit 1 (with bit 0) =
 paused; job progress = file progress ÷ file total; the job counter only goes up for finished
-jobs, which is how "finished" and "stopped at N%" are told apart. Framing doesn't count as a
-job. Hour counters are in seconds, the controller's previous job time in milliseconds. Other
+jobs, which is how "finished" and "stopped at N%" are told apart. Jogging from the panel
+doesn't change the status bits, so "Moving" comes from the head position changing; moves
+without a job file don't count as jobs. Hour counters are in seconds, the controller's previous job time in milliseconds. Other
 models may differ; `/api/laser` includes the raw values under `controller.raw` for checking.
 
 Laggy or choppy: lower resolution or frame rate. Weak WiFi is the usual cause.

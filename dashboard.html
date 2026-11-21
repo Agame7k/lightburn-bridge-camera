@@ -39,7 +39,10 @@ a.pill{color:inherit;text-decoration:none}
 .jobmeta{color:var(--muted);margin-top:6px;font-variant-numeric:tabular-nums}
 .bar.big{height:12px;border-radius:6px;margin-top:10px}
 .kv.big{font-size:15px}
-.jobstate.running{color:var(--ok)} .jobstate.paused{color:var(--warn)}
+.ctl{display:flex;flex-wrap:wrap;gap:8px;margin-top:14px}
+.ctl button{flex:1 1 0;min-width:96px;padding:11px 12px;font-weight:600}
+button.danger{background:var(--bad);border-color:var(--bad);color:#fff}
+.jobstate.running{color:var(--ok)} .jobstate.paused{color:var(--warn)} .jobstate.moving{color:var(--accent)}
 .laserState{margin-bottom:6px}
 .sub{margin:14px 0 6px;font-size:11px;font-weight:650;letter-spacing:.06em;text-transform:uppercase;color:var(--muted)}
 .bar{height:6px;border-radius:3px;background:var(--field);border:1px solid var(--line);margin-top:6px;overflow:hidden}
@@ -94,6 +97,18 @@ details.panel[open] summary h2::after{content:" ▾"}
 #toast{position:fixed;right:16px;bottom:16px;background:var(--text);color:var(--bg);padding:9px 14px;border-radius:8px;font-size:13px;opacity:0;transform:translateY(8px);transition:.2s;pointer-events:none;max-width:calc(100vw - 32px)}
 #toast.show{opacity:1;transform:none}
 #toast.err{background:var(--bad);color:#fff}
+#notes{position:fixed;top:64px;right:16px;z-index:5;display:flex;flex-direction:column;gap:8px;width:min(340px,calc(100vw - 32px));pointer-events:none}
+.note{pointer-events:auto;display:grid;grid-template-columns:4px 1fr auto;gap:0 10px;background:var(--panel);border:1px solid var(--line);border-radius:10px;box-shadow:0 6px 24px rgba(0,0,0,.18);padding:10px 10px 10px 0;overflow:hidden;animation:notein .25s ease-out}
+.note .stripe{grid-row:1/3;background:var(--muted);border-radius:0 3px 3px 0}
+.note.ok .stripe{background:var(--ok)} .note.warn .stripe{background:var(--warn)} .note.bad .stripe{background:var(--bad)} .note.info .stripe{background:var(--accent)}
+.note b{font-size:14px} .note .when{color:var(--muted);font-size:11px;font-weight:400;margin-left:6px}
+.note .detail{grid-column:2;color:var(--muted);font-size:13px}
+.note button{grid-row:1/3;grid-column:3;align-self:start;border:0;background:none;padding:0 4px;font-size:18px;line-height:1;color:var(--muted)}
+.note.out{opacity:0;transform:translateX(12px);transition:.25s}
+@keyframes notein{from{opacity:0;transform:translateX(16px)}to{opacity:1;transform:none}}
+#soundBtn{padding:4px 8px;font-size:13px;line-height:1.2}
+#soundBtn.on{border-color:var(--accent);color:var(--accent)}
+@media (max-width:420px){#notes{top:auto;bottom:16px}}
 </style>
 </head>
 <body>
@@ -101,6 +116,7 @@ details.panel[open] summary h2::after{content:" ▾"}
   <h1>Bridge Camera</h1><span class="ver" id="ver"></span>
   <nav class="tabs"><a href="/" id="navSetup">Setup</a><a href="/monitor" id="navMonitor">Monitor</a></nav>
   <span class="spacer"></span>
+  <button id="soundBtn" title="Play a sound for job and laser alerts">🔕</button>
   <a class="pill" id="laserPill" href="/monitor" title="Laser controller" hidden><span class="dot"></span><span id="laserPillText">Laser</span></a>
   <span class="pill" id="pill"><span class="dot"></span><span id="pilltext">Connecting…</span></span>
 </header>
@@ -239,8 +255,14 @@ details.panel[open] summary h2::after{content:" ▾"}
         <div class="jobhead"><span class="jobstate" id="jobState">—</span><span class="jobpct" id="jobPct"></span></div>
         <div class="bar big" id="jobBarWrap" hidden><div id="jobBar"></div></div>
         <div class="jobmeta" id="jobTime"></div>
+        <div class="banner bad" id="jobWarn"><b>Laser isn't firing</b>The job has been running for over 20 s but the laser hasn't fired. Check the laser's panel for an alarm (e.g. Water Prot: is the water pump on?).</div>
         <dl class="kv big" id="poskv" style="margin-top:12px"></dl>
         <div class="hint" id="ctrlNote"></div>
+        <div class="ctl" id="ctlBtns" hidden>
+          <button id="cPause">❚❚ Pause</button>
+          <button id="cResume" class="primary">▶ Resume</button>
+          <button id="cStop" class="danger">■ Stop</button>
+        </div>
       </div>
     </div>
   </section>
@@ -266,9 +288,10 @@ details.panel[open] summary h2::after{content:" ▾"}
       <div class="body"><dl class="kv" id="bridgekv"></dl><dl class="kv" id="healthkv"></dl></div>
     </div>
 
-    <div class="hint" style="padding:0 4px">Read-only: checks the Ethernet link, pings the controller and reads its status the same way LightBurn does, from a separate address so LightBurn's relay is never disturbed. Nothing on the laser is changed.</div>
+    <div class="hint" style="padding:0 4px">Status is read the same way LightBurn does, from a separate address so LightBurn's relay is never disturbed. The buttons send commands to the laser; the Bridge only allows each one when it makes sense (Pause while running, Resume while paused, Stop during a job). Never leave a running laser unattended.</div>
   </aside>
 </main>
+<div id="notes" aria-live="polite"></div>
 <div id="toast"></div>
 
 <script>
@@ -331,6 +354,7 @@ function render(){
   renderUrls(s);
   renderStatus(s);
   renderBridge(s);
+  watchCamera(s);
   if (!dirty) renderCameraForm(s);
   renderControls();
 }
@@ -646,6 +670,126 @@ $("#netApply").addEventListener("click", async () => {
   } catch(e) { toast(e.message, true); btn.disabled = false; }
 });
 
+
+/* ---------- notices: job / laser / camera / Bridge events ---------- */
+const notes = {unseen: 0, baseTitle: null, sound: false, ctx: null};
+try { notes.sound = localStorage.getItem("lbcamSound") === "1"; } catch(e) {}
+function drawSound(){ const b = $("#soundBtn"); b.textContent = notes.sound ? "🔔" : "🔕"; b.classList.toggle("on", notes.sound);
+  b.title = notes.sound ? "Sound on for alerts (click to mute)" : "Play a sound for job and laser alerts"; }
+$("#soundBtn").addEventListener("click", () => {
+  notes.sound = !notes.sound;
+  try { localStorage.setItem("lbcamSound", notes.sound ? "1" : "0"); } catch(e) {}
+  drawSound(); if (notes.sound) chime("ok");
+});
+drawSound();
+function chime(kind){
+  if (!notes.sound) return;
+  try {
+    notes.ctx = notes.ctx || new (window.AudioContext || window.webkitAudioContext)();
+    const c = notes.ctx, t0 = c.currentTime;
+    const tones = kind === "ok" ? [660, 880] : kind === "info" ? [660] : [440, 330];
+    tones.forEach((f, i) => {
+      const o = c.createOscillator(), g = c.createGain();
+      o.frequency.value = f; o.type = "sine";
+      g.gain.setValueAtTime(0.0001, t0 + i*0.18); g.gain.exponentialRampToValueAtTime(0.25, t0 + i*0.18 + 0.02);
+      g.gain.exponentialRampToValueAtTime(0.0001, t0 + i*0.18 + 0.3);
+      o.connect(g).connect(c.destination); o.start(t0 + i*0.18); o.stop(t0 + i*0.18 + 0.32);
+    });
+  } catch(e) {}
+}
+function drawTitle(){
+  if (notes.baseTitle === null) notes.baseTitle = document.title;
+  document.title = (notes.unseen ? "(" + notes.unseen + ") " : "") + notes.baseTitle;
+}
+document.addEventListener("visibilitychange", () => { if (!document.hidden) { notes.unseen = 0; drawTitle(); } });
+// kind: ok | info | warn | bad. sticky notices stay until dismissed.
+function notify(kind, title, detail, sticky){
+  const box = $("#notes"), n = document.createElement("div");
+  const when = new Date().toLocaleTimeString([], {hour:"2-digit", minute:"2-digit"});
+  n.className = "note " + kind;
+  n.innerHTML = `<span class="stripe"></span><div><b>${esc(title)}</b><span class="when">${esc(when)}</span></div>` +
+    (detail ? `<div class="detail">${esc(detail)}</div>` : "") + `<button aria-label="Dismiss">×</button>`;
+  const close = () => { n.classList.add("out"); setTimeout(() => n.remove(), 260); };
+  n.querySelector("button").onclick = close;
+  box.prepend(n);
+  while (box.children.length > 5) box.lastElementChild.remove();
+  if (!sticky) setTimeout(close, 8000);
+  if (document.hidden) { notes.unseen++; drawTitle(); }
+  chime(kind);
+}
+
+// compare each new reading with the previous one; the first reading only sets the baseline
+const seen = {};
+function watchLaser(l){
+  const c = l.controller || {}, prev = seen.laser;
+  seen.laser = {state: l.state, avail: !!c.available, ctrl: c.available ? c.state : null,
+                ended: c.last_job ? c.last_job.ended : null, notFiring: !!c.not_firing};
+  if (!prev) return;
+  const cur = seen.laser;
+  if (prev.state === "ok" && cur.state !== "ok" && cur.state !== "unknown")
+    notify("bad", "Laser disconnected", l.message, true);
+  else if (prev.state !== "ok" && cur.state === "ok" && prev.state !== "unknown")
+    notify("ok", "Laser connected", l.message);
+  if (!cur.avail || !prev.avail) return;
+  if (prev.ctrl !== "running" && prev.ctrl !== "paused" && cur.ctrl === "running") notify("info", "Job started");
+  else if (prev.ctrl === "running" && cur.ctrl === "paused") notify("warn", "Job paused", c.progress != null ? "at " + Math.round(c.progress) + "%" : "");
+  else if (prev.ctrl === "paused" && cur.ctrl === "running") notify("info", "Job resumed");
+  if (cur.notFiring && !prev.notFiring) notify("bad", "Laser isn't firing", "The job has been running for over 20 s but the laser hasn't fired. Check the laser's panel for an alarm (e.g. Water Prot: is the water pump on?).", true);
+  if (cur.ended && cur.ended !== prev.ended) {
+    const j = c.last_job;
+    if (j.result === "finished") notify("ok", "Job finished", "Took " + dur(j.seconds), true);
+    else notify("warn", "Job stopped at " + Math.round(j.progress) + "%", "After " + dur(j.seconds), true);
+  }
+}
+function watchCamera(s){
+  const prev = seen.cam; seen.cam = s.state;
+  if (!prev || prev === s.state) return;
+  const live = st => st === "streaming" || st === "idle";
+  if (live(prev) && s.state === "searching") notify("warn", "Camera disconnected", s.message || "", true);
+  else if (live(prev) && s.state === "error") notify("bad", "Camera error", s.message || "", true);
+  else if (!live(prev) && prev !== "starting" && live(s.state)) notify("ok", "Camera connected", (s.camera && s.camera.name) || "");
+}
+function watchHealth(h){
+  const hot = h.temp_c != null && h.temp_c >= 75;
+  const power = (h.power_issues || []).filter(x => x.endsWith("now"));
+  const prev = seen.health; seen.health = {hot, power: power.join(",")};
+  if (!prev) return;
+  if (hot && !prev.hot) notify("warn", "Bridge is running hot", h.temp_c + " °C", true);
+  if (power.length && power.join(",") !== prev.power) notify("bad", "Bridge power problem", power.join(", ") + " (check the power supply)", true);
+}
+
+
+/* ---------- laser control buttons (the Bridge re-checks every rule) ---------- */
+const CTL = {
+  cPause:  {cmd:"pause",  when:["running"]},
+  cResume: {cmd:"resume", when:["paused"]},
+  cStop:   {cmd:"stop",   when:["running","paused"], ask:"Stop the job?\n\nA stopped job can't be resumed."},
+};
+let ctlBusy = false;
+function drawControls(c){
+  const box = $("#ctlBtns");
+  if (!c || !c.available) { box.hidden = true; return; }
+  box.hidden = false;
+  for (const [id, d] of Object.entries(CTL)) {
+    const b = $("#" + id);
+    b.hidden = !d.when.includes(c.state);
+    b.disabled = ctlBusy;
+  }
+  if (![...box.children].some(b => !b.hidden)) box.hidden = true;  // e.g. while moving
+}
+for (const [id, d] of Object.entries(CTL)) {
+  $("#" + id).addEventListener("click", async () => {
+    if (d.ask && !confirm(d.ask)) return;
+    ctlBusy = true; document.querySelectorAll("#ctlBtns button").forEach(b => b.disabled = true);
+    try {
+      await api("/api/laser/command", {cmd: d.cmd});
+      toast({pause:"Pause sent", resume:"Resume sent", stop:"Stop sent"}[d.cmd]);
+    } catch(e) { notify("bad", "Laser command failed", e.message, true); }
+    ctlBusy = false;
+    loadLaser();
+  });
+}
+
 /* ---------- which view: / = setup, /monitor = monitoring ---------- */
 const MONITOR = location.pathname.replace(/\/+$/, "") === "/monitor";
 $("#setupView").hidden = MONITOR;
@@ -689,18 +833,19 @@ async function loadLaser(fresh){
   if (l.relay && l.relay.message) rows.push(["Last activity", l.relay.message]);
   $("#laserkv").innerHTML = rows.map(([a,b]) => `<dt>${esc(a)}</dt><dd>${esc(b)}</dd>`).join("");
   renderController(l.controller);
+  watchLaser(l);
 }
 const dur = s => { if (s == null) return "—"; s = Math.round(s); const h = Math.floor(s/3600), m = Math.floor(s%3600/60), x = s%60;
   return h ? `${h}h ${String(m).padStart(2,"0")}m` : m ? `${m}m ${String(x).padStart(2,"0")}s` : `${x}s`; };
 const hours = s => s == null ? "—" : (s/3600).toFixed(1) + " h";
 function renderController(c){
   const wrap = $("#ctrlWrap"), note = $("#ctrlNote");
-  const none = msg => { wrap.hidden = true; note.textContent = msg; $("#jobState").textContent = "—"; $("#jobState").className = "jobstate";
+  const none = msg => { $("#jobWarn").classList.remove("show"); wrap.hidden = true; note.textContent = msg; $("#jobState").textContent = "—"; $("#jobState").className = "jobstate";
     $("#jobPct").textContent = ""; $("#jobBarWrap").hidden = true; $("#jobTime").textContent = ""; $("#poskv").innerHTML = ""; };
-  if (!c) return none("");
-  if (!c.available) return none("Controller status: " + (c.reason || "unavailable"));
+  if (!c) { drawControls(null); return none(""); }
+  if (!c.available) { drawControls(null); return none("Controller status: " + (c.reason || "unavailable")); }
   wrap.hidden = false; note.textContent = "";
-  const st = {running:"Running", paused:"Paused", idle:"Idle"}[c.state] || c.state || "—";
+  const st = {running:"Running", paused:"Paused", moving:"Moving", idle:"Idle"}[c.state] || c.state || "—";
   $("#jobState").textContent = st;
   $("#jobState").className = "jobstate " + (c.state || "");
   const showPct = c.running && c.progress != null;
@@ -709,13 +854,15 @@ function renderController(c){
   $("#jobBar").style.width = (c.progress || 0) + "%";
   const at = t => new Date(t*1000).toLocaleTimeString([], {hour:"2-digit", minute:"2-digit"});
   const lj = c.last_job;
+  $("#jobWarn").classList.toggle("show", !!c.not_firing);
   $("#jobTime").textContent = c.running ? (c.paused ? "Paused · " : "") + "Elapsed " + dur(c.elapsed)
     : lj && lj.result === "finished" ? "Last job finished in " + dur(lj.seconds) + " at " + at(lj.ended)
     : lj ? "Last job stopped at " + Math.round(lj.progress) + "% after " + dur(lj.seconds) + ", " + at(lj.ended)
     : (c.counters && c.counters.prev_work_time > 0) ? "Last job took " + dur(c.counters.prev_work_time / 1000) + " (from the controller)"
     : "No job since the Bridge started";
+  drawControls(c);
   const p = c.position || {}, k = c.counters || {};
-  const pos = ["x","y"].filter(a => p[a] != null);  // Z/U report placeholder values on machines without those axes
+  const pos = (c.axes || ["x","y","z"]).filter(a => p[a] != null);
   $("#poskv").innerHTML = pos.map(a => `<dt>${a.toUpperCase()}</dt><dd>${p[a].toFixed(1)} mm</dd>`).join("");
   const rows = [
     ["Model", c.model || "—"],
@@ -734,6 +881,7 @@ async function loadHealth(){
   if (h.power_issues) rows.push(["Power", h.power_issues.length ? "⚠ " + h.power_issues.join(", ") : "OK"]);
   if (h.load != null) rows.push(["CPU load", h.load.toFixed(2)]);
   $("#healthkv").innerHTML = rows.map(([a,b]) => `<dt>${esc(a)}</dt><dd>${esc(b)}</dd>`).join("");
+  watchHealth(h);
 }
 function renderBridge(s){
   const cam = s.camera || {};
@@ -744,10 +892,11 @@ function renderBridge(s){
   const tags = s.state === "streaming" ? [`${cam.width}×${cam.height}`, `${s.fps || 0} fps`] : [camTxt];
   $("#monTags").innerHTML = tags.map(x => `<span class="tag">${esc(x)}</span>`).join("");
 }
-if (MONITOR) { loadHealth(); setInterval(() => { if (!document.hidden) loadHealth(); }, 10000); }
+loadHealth(); setInterval(loadHealth, MONITOR ? 10000 : 30000);  // health alerts on both pages
 $("#laserCheck").onclick = async () => { $("#laserCheck").disabled = true; await loadLaser(true); $("#laserCheck").disabled = false; toast("Checked"); };
 loadLaser();
-setInterval(() => { if (!busy && !document.hidden) loadLaser(); }, MONITOR ? 2000 : 10000);
+// keep polling when the tab is hidden too, so alerts still arrive
+setInterval(() => { if (!busy) loadLaser(); }, MONITOR ? 2000 : 10000);
 
 /* ---------- log ---------- */
 async function loadLog(){

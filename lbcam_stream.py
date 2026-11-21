@@ -12,6 +12,7 @@ Endpoints
   /snapshot[.jpg]    single JPEG   -> LightBurn "network camera" (snapshot)
   /status            short JSON status
   /api/...           JSON API used by the dashboard
+                     (POST /api/laser/command {"cmd": pause|resume|stop} commands the laser)
 
 When no camera is usable, /stream and /snapshot serve a "Camera not connected" image
 (placeholder.jpg) instead of hanging, and switch back to live video automatically.
@@ -45,7 +46,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "2.9"
+VERSION = "2.15"
 LBCAM_HOME = os.environ.get("LBCAM_HOME", "/opt/lbcam")
 
 # ======================================================================== V4L2
@@ -1230,12 +1231,27 @@ MEM = {  # address -> key (addresses are 14-bit: byte pair hi*128+lo)
     0x0208: "prev_work_time", 0x0211: "laser_time", 0x0320: "file_total", 0x0321: "file_progress",
     0x02FE: "card_id",
 }
-MEM_FAST = (0x0200, 0x0221, 0x0231, 0x0241, 0x0251, 0x0320, 0x0321, 0x0203, 0x0208)
-MEM_SLOW = (0x0201, 0x0202, 0x0205, 0x0211, 0x02FE)
-# Status bits as seen on an RDC6442G: bit 0 = job running, bit 1 (with bit 0) = paused.
-# (MeerK40t names bit 1 "part end"; on real hardware it is set exactly while paused.)
-STATUS_JOB_RUNNING, STATUS_PAUSED = 0x01, 0x02
+MEM_FAST = (0x0200, 0x0221, 0x0231, 0x0241, 0x0251, 0x0320, 0x0321, 0x0203, 0x0208, 0x0211)
+MEM_SLOW = (0x0201, 0x0202, 0x0205, 0x02FE)
+# Status bits as seen on an RDC6442G: bit 0 = busy (job or manual move); during a job bit 9
+# (0x200) is clear and bit 1 means paused. Jogging sets bits 0 and 9 (and 1), and the job file
+# total reads FILE_TOTAL_UNKNOWN. (MeerK40t calls bit 1 "part end"; on hardware it is paused.)
+STATUS_BUSY, STATUS_PAUSED, STATUS_MANUAL = 0x01, 0x02, 0x200
 FILE_TOTAL_UNKNOWN = 1000000000  # reported while framing / no job loaded
+MOVING_HOLD = 3.0  # s: show "moving" this long after the last position change
+# A job that has been running (not paused) this long without the laser-on counter moving is
+# probably blocked by an alarm. Water protection, for example, isn't readable from the controller.
+NOT_FIRING_AFTER = 20.0
+# Control commands (MeerK40t's Ruida driver): sent on 50200 like everything else, answered with ACK.
+# name -> (bytes, states it is allowed in). Verified on an RDC6442G.
+# Deliberately NOT here: D8 2A ("Home XY" in MeerK40t) reset/rebooted an RDC6442G, and the
+# panel Frame key A5 53 00 is acknowledged but ignored on port 50200.
+RUIDA_COMMANDS = {
+    "pause":  (b"\xD8\x02", ("running",)),
+    "resume": (b"\xD8\x03", ("paused",)),
+    "stop":   (b"\xD8\x01", ("running", "paused")),
+}
+RUIDA_ACK, RUIDA_NAK = 0xCC, 0xCF
 
 
 def _swz(b, m):
@@ -1310,7 +1326,8 @@ class RuidaUDP:
     def close(self):
         self.sock.close()
 
-    def read(self, addr, magic):
+    def read(self, addr, magic, timeout=None, tries=2):
+        timeout = timeout or self.timeout
         req = ruida_read_request(addr)
         try:
             while True:  # drop anything stale
@@ -1320,10 +1337,10 @@ class RuidaUDP:
             pass
         except OSError:
             pass
-        self.sock.settimeout(self.timeout)
-        for _ in range(2):
+        self.sock.settimeout(timeout)
+        for _ in range(tries):
             self.sock.sendto(ruida_packet(req, magic), self.addr)
-            end = time.time() + self.timeout
+            end = time.time() + timeout
             while time.time() < end:
                 try:
                     self.sock.settimeout(max(0.01, end - time.time()))
@@ -1336,6 +1353,36 @@ class RuidaUDP:
                 if r and r[0] == addr:
                     return r[1]
         return None
+
+
+def _ruida_send(self, payload, magic):
+    """Send one command and wait for its 1-byte answer: "ack", "nak" or None (no answer).
+    Never retried here: a command that may have run must not run twice."""
+    try:
+        while True:  # drop stale replies
+            self.sock.setblocking(False)
+            self.sock.recv(2048)
+    except (BlockingIOError, InterruptedError, OSError):
+        pass
+    self.sock.sendto(ruida_packet(payload, magic), self.addr)
+    end = time.time() + 1.0
+    while time.time() < end:
+        try:
+            self.sock.settimeout(max(0.01, end - time.time()))
+            data, src = self.sock.recvfrom(2048)
+        except socket.timeout:
+            break
+        if src[0] != self.addr[0] or len(data) != 1:
+            continue
+        b = ruida_unswizzle(data, magic)[0]
+        if b == RUIDA_ACK:
+            return "ack"
+        if b == RUIDA_NAK:
+            return "nak"
+    return None
+
+
+RuidaUDP.send = _ruida_send
 
 
 class NetNS:
@@ -1397,6 +1444,10 @@ class NetNS:
             self._setns(self.home_fd)
 
 
+class RuidaCommandError(Exception):
+    pass
+
+
 class Ruida:
     """Polls the controller's status in the background (read-only memory reads)."""
 
@@ -1413,6 +1464,11 @@ class Ruida:
         self.job = None       # the run in progress: {"start", "count0", "progress"}
         self.last_job = None  # {"seconds", "ended", "result": finished|stopped, "progress"}
         self.recheck_until = 0.0
+        self.first_u, self.u_moved = None, False
+        self.last_pos, self.moved_at = None, 0.0
+        self.cmd = None  # {"name", "payload", "who", "done": Event, "result"}
+        self.scan_job = None  # {"start", "count", "done": Event, "result"}
+        self.cmd_lock = threading.Lock()
         self.updated = None
         self.ns = None
 
@@ -1450,6 +1506,10 @@ class Ruida:
                         transport.close()
                     transport, laser_ip, self.magic = self._transport(ip), ip, None
                 link = self.laser.link()[1]
+                if link and self.cmd:
+                    self._do_command(transport)
+                if link and self.scan_job:
+                    self._do_scan(transport)
                 if not link:
                     self._set(False, "no Ethernet link")
                 elif self.poll_once(transport, slow=time.time() >= slow_at):
@@ -1471,6 +1531,93 @@ class Ruida:
             fast = time.time() < self.wanted_until or self._running()
             self.wake.wait(2 if fast else 20)
             self.wake.clear()
+
+    # ---- control commands
+    def command(self, name, who="?", timeout=5.0):
+        """Run a control command from the dashboard. Raises RuidaCommandError with a reason."""
+        if name not in RUIDA_COMMANDS:
+            raise RuidaCommandError("unknown command")
+        payload, allowed = RUIDA_COMMANDS[name]
+        with self.lock:
+            available, state = self.state.get("available"), self.values.get("state")
+        if not self.enabled or not available or self.magic is None:
+            raise RuidaCommandError("the controller isn't connected")
+        if state not in allowed:
+            raise RuidaCommandError("can't %s while the laser is %s" % (name, state or "unknown"))
+        job = {"name": name, "payload": payload, "who": who, "done": threading.Event(), "result": None}
+        with self.cmd_lock:
+            if self.cmd:
+                raise RuidaCommandError("another command is still being sent")
+            self.cmd = job
+        self.wake.set()
+        if not job["done"].wait(timeout):
+            with self.cmd_lock:
+                if self.cmd is job:
+                    self.cmd = None
+            raise RuidaCommandError("the Bridge couldn't send it in time")
+        if job["result"] != "ack":
+            raise RuidaCommandError("the laser didn't confirm it (%s) - check the machine"
+                                    % (job["result"] or "no answer"))
+        return True
+
+    # ---- diagnostics: read a range of controller memory (read-only, same reads as status)
+    SCAN_MAX = 2048
+
+    def scan(self, start, count, who="?"):
+        """{address: value} for every address in range that answers. Only while idle."""
+        count = max(1, min(int(count), self.SCAN_MAX))
+        start = max(0, min(int(start), 0x3FFF))
+        count = min(count, 0x4000 - start)
+        with self.lock:
+            available, state = self.state.get("available"), self.values.get("state")
+        if not self.enabled or not available or self.magic is None:
+            raise RuidaCommandError("the controller isn't connected")
+        if state not in ("idle", None):
+            raise RuidaCommandError("only while the laser is idle (it is %s)" % state)
+        job = {"start": start, "count": count, "who": who, "done": threading.Event(), "result": None}
+        with self.cmd_lock:
+            if self.scan_job or self.cmd:
+                raise RuidaCommandError("busy, try again in a moment")
+            self.scan_job = job
+        self.wake.set()
+        if not job["done"].wait(10 + count * 0.12):
+            raise RuidaCommandError("scan timed out")
+        return job["result"]
+
+    def _do_scan(self, transport):
+        job = self.scan_job
+        t0, out, missing = time.time(), {}, 0
+        for addr in range(job["start"], job["start"] + job["count"]):
+            v = transport.read(addr, self.magic, timeout=0.06, tries=1)
+            if v is None:
+                missing += 1
+            else:
+                out["0x%04X" % addr] = v
+        job["result"] = {"start": "0x%04X" % job["start"], "count": job["count"], "answered": len(out),
+                         "missing": missing, "seconds": round(time.time() - t0, 1), "values": out}
+        log("controller memory scan 0x%04X+%d from %s: %d answered in %.1fs"
+            % (job["start"], job["count"], job["who"], len(out), time.time() - t0))
+        with self.cmd_lock:
+            self.scan_job = None
+        job["done"].set()
+
+    def _do_command(self, transport):
+        with self.cmd_lock:
+            job = self.cmd
+        if not job:
+            return
+        try:
+            res = transport.send(job["payload"], self.magic)
+            if res == "nak":  # checksum rejected: it did not run, safe to send once more
+                res = transport.send(job["payload"], self.magic)
+        except OSError as e:
+            res = "error: %s" % e
+        job["result"] = res
+        log("laser command: %s from %s -> %s" % (job["name"], job["who"], res or "no answer"))
+        with self.cmd_lock:
+            self.cmd = None
+        job["done"].set()
+        self.want()  # poll fast so the dashboard shows the result
 
     def _detect_magic(self, t):
         for m in ((self.magic,) if self.magic else RUIDA_MAGICS):
@@ -1518,17 +1665,36 @@ class Ruida:
         progress = (round(100.0 * prog / tot, 1)
                     if tot and 0 < tot < FILE_TOTAL_UNKNOWN and prog is not None and 0 <= prog <= tot else None)
         count = r.get("work_count")
+        lt = r.get("laser_time")
         st = r.get("status")
         if st is not None:
-            running = bool(st & STATUS_JOB_RUNNING)
+            busy = bool(st & STATUS_BUSY)
+            has_file = bool(tot) and 0 < tot < FILE_TOTAL_UNKNOWN
+            running = busy and not (st & STATUS_MANUAL) and has_file
             paused = running and bool(st & STATUS_PAUSED)
-            v["running"], v["paused"] = running, paused
-            v["state"] = "paused" if paused else "running" if running else "idle"
+            # jogging from the panel doesn't touch the status bits at all, so also watch the position
+            pos = tuple(r.get(k) for k in ("x", "y", "z", "u"))
+            if self.last_pos and any(a is not None and b is not None and abs(a - b) > 50  # µm
+                                     for a, b in zip(pos, self.last_pos)):
+                self.moved_at = now
+            self.last_pos = pos
+            moving = not running and (busy or now - self.moved_at < MOVING_HOLD)
+            v["running"], v["paused"], v["moving"] = running, paused, moving
+            v["state"] = "paused" if paused else "running" if running else "moving" if moving else "idle"
             if running:
                 if not self.job:
-                    self.job = {"start": now, "count0": count, "progress": None}
+                    self.job = {"start": now, "count0": count, "progress": None,
+                                "laser0": lt, "run_s": 0.0, "tick": now, "fired": False}
+                job = self.job
                 if progress is not None:
-                    self.job["progress"] = progress
+                    job["progress"] = progress
+                if not paused:
+                    job["run_s"] += now - job["tick"]
+                job["tick"] = now
+                if job["laser0"] is None:
+                    job["laser0"] = lt
+                elif lt is not None and lt > job["laser0"]:
+                    job["fired"] = True
             elif self.job:
                 self._job_ended(self.job, now, count)
                 self.job = None
@@ -1537,8 +1703,19 @@ class Ruida:
         if lj and lj["result"] == "stopped" and now < self.recheck_until and self._counted(lj.get("count0"), count):
             lj["result"], lj["progress"] = "finished", 100.0
         v["elapsed"] = round(now - self.job["start"]) if self.job else None
+        j = self.job
+        v["not_firing"] = bool(j and not j["fired"] and j["laser0"] is not None
+                               and j["run_s"] >= NOT_FIRING_AFTER)
+        if v["not_firing"] and not j.get("warned"):
+            j["warned"] = True
+            log("laser job has run %ds without firing - alarm on the panel?" % j["run_s"])
         v["progress"] = progress if self.job else None
         v["position"] = {k: round(r[k] / 1000.0, 2) for k in ("x", "y", "z", "u") if k in r}
+        # U often reads a fixed value on machines without a rotary: show it once it has moved
+        if "u" in r:
+            self.first_u = r["u"] if self.first_u is None else self.first_u
+            self.u_moved = self.u_moved or r["u"] != self.first_u
+        v["axes"] = ["x", "y", "z"] + (["u"] if self.u_moved else [])
         v["counters"] = {k: r[k] for k in ("open_time", "work_time", "laser_time", "work_count",
                                              "doc_count", "prev_work_time") if k in r}
         cid = r.get("card_id")
@@ -2068,6 +2245,18 @@ def make_handler(cam, cfg, dashboard, updater, net=None, laser=None, ruida=None)
                     ruida.want()
                     out["controller"] = ruida.status()
                 return self._json(out)
+            if p == "/api/laser/scan":
+                if not ruida:
+                    return self._json({"error": "not available"}, 409)
+                q = parse_qs(u.query)
+                try:
+                    start = int((q.get("start") or ["0x200"])[0], 0)
+                    count = int((q.get("count") or ["256"])[0], 0)
+                    return self._json(ruida.scan(start, count, who=self.client_address[0]))
+                except ValueError:
+                    return self._json({"error": "start/count must be numbers"}, 400)
+                except RuidaCommandError as e:
+                    return self._json({"error": str(e)}, 409)
             if p == "/api/health":
                 if time.time() - health_cache["t"] > 5:
                     health_cache["v"], health_cache["t"] = pi_health(), time.time()
@@ -2091,6 +2280,15 @@ def make_handler(cam, cfg, dashboard, updater, net=None, laser=None, ruida=None)
             if body is None:
                 return self._json({"error": "invalid JSON"}, 400)
             try:
+                if p == "/api/laser/command":
+                    if not ruida:
+                        return self._json({"error": "laser control isn't available"}, 409)
+                    name = str(body.get("cmd") or "")
+                    try:
+                        ruida.command(name, who=self.client_address[0])
+                    except RuidaCommandError as e:
+                        return self._json({"error": "Couldn't %s: %s" % (name, e)}, 409)
+                    return self._json({"ok": True, "cmd": name})
                 if p == "/api/network":
                     return self._json(dict(ok=True, **net.apply(body)))
                 if p == "/api/network/confirm":

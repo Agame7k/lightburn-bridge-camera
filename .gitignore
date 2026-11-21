@@ -17,3 +17,5 @@ lbcam-update-*.tar.gz
 *.swp
 .vscode/
 .idea/
+net_pending.json
+net_pending.json.tmp

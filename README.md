@@ -61,11 +61,29 @@ Asks for the Bridge's SSH password once (stock image: user `pi`, see [Security](
 
 In LightBurn's camera settings choose a network camera and enter:
 
-- MJPEG stream: `http://<bridge-ip>:8080/stream` (recommended)
-- Snapshot: `http://<bridge-ip>:8080/snapshot.jpg`
+- MJPEG stream: `http://lightburnbridge.local:8080/stream` (recommended)
+- Snapshot: `http://lightburnbridge.local:8080/snapshot.jpg`
+
+The `.local` name keeps working if the Bridge's IP changes (macOS supports it out of the
+box; on Windows/Linux it needs mDNS/Bonjour). Otherwise use the IP: `http://<bridge-ip>:8080/stream`.
 
 Then run *Calibrate Camera Lens* and *Align Camera*. Redo both after changing camera or
-resolution. Reserve the Bridge's IP in your router so the URL doesn't change.
+resolution.
+
+## Static IP
+
+Dashboard → **Network** sets the Bridge's **WiFi** address to DHCP or a static IP. The
+laser's Ethernet link isn't touched.
+
+- Input is validated: subnet, gateway inside the subnet, not the laser's subnet, and a ping
+  check that the address isn't already in use.
+- After **Apply** the page opens the new address. You have **90 seconds** to press
+  **Keep settings** there, otherwise the previous settings are restored automatically. This
+  also works across a crash or reboot.
+- Choose an address outside your router's DHCP range. A DHCP reservation in the router is an
+  equally good alternative.
+- If the Bridge is later set up for a different WiFi network (LightBurn's `wifi.txt`), it
+  goes back to DHCP.
 
 ## Updating
 
@@ -123,6 +141,10 @@ sudo journalctl -u lbcam -f
 | `POST /api/update` | update file as the body (`X-Password` header if a password is set) |
 | `POST /api/update/rollback` | `{"password"}` |
 | `POST /api/update/password` | `{"current","new"}`. An empty `new` removes the password |
+| `GET /api/network` | WiFi connection, address, mode, pending change |
+| `POST /api/network` | `{"mode":"dhcp"}` or `{"mode":"static","address","prefix","gateway","dns"}` |
+| `POST /api/network/confirm` | keep a pending change |
+| `POST /api/network/revert` | undo a pending change now |
 
 ## Development
 

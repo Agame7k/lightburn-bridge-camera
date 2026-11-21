@@ -42,7 +42,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "2.2"
+VERSION = "2.4"
 LBCAM_HOME = os.environ.get("LBCAM_HOME", "/opt/lbcam")
 
 # ======================================================================== V4L2
@@ -719,6 +719,274 @@ class Updater:
                 shutil.rmtree(os.path.join(rel, d), ignore_errors=True)
 
 
+# ======================================================================== network (WiFi IP)
+
+NET_CONFIRM_SECONDS = int(os.environ.get("LBCAM_NET_CONFIRM", "90"))
+
+
+class NetError(Exception):
+    pass
+
+
+def _nm_split(line):
+    """Split one `nmcli -t` line on unescaped ':' and unescape '\\:' / '\\\\'."""
+    out, cur, i = [], "", 0
+    while i < len(line):
+        c = line[i]
+        if c == "\\" and i + 1 < len(line):
+            cur += line[i + 1]
+            i += 2
+            continue
+        if c == ":":
+            out.append(cur)
+            cur = ""
+        else:
+            cur += c
+        i += 1
+    out.append(cur)
+    return out
+
+
+class Network:
+    """
+    Static IP / DHCP for the Bridge's WiFi connection via NetworkManager (nmcli).
+
+    Never touches the laser's Ethernet link. Every change must be confirmed from the
+    new address within NET_CONFIRM_SECONDS, otherwise the previous settings come back
+    (also after a crash or reboot, via net_pending.json).
+    LBCAM_NET_DRYRUN=1 logs changes instead of applying them (for testing on a PC).
+    """
+
+    def __init__(self, home=LBCAM_HOME):
+        self.pending_path = os.path.join(home if os.path.isdir(home) else
+                                         os.path.dirname(os.path.abspath(__file__)), "net_pending.json")
+        self.dry = os.environ.get("LBCAM_NET_DRYRUN") == "1"
+        self.lock = threading.Lock()
+        self.timer = None
+        self.last_error = None
+        p = self._pending()
+        if p:  # resume the confirm countdown after a restart
+            self._arm(max(1.0, p["deadline"] - time.time()))
+
+    # ------------------------------------------------------------ nmcli
+    def _run(self, args, write=False, timeout=20):
+        if write and self.dry:
+            log("[net dry-run] nmcli", " ".join(args))
+            return ""
+        try:
+            r = subprocess.run(["nmcli"] + args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               universal_newlines=True, timeout=timeout)
+        except FileNotFoundError:
+            raise NetError("NetworkManager (nmcli) is not available on this system")
+        except subprocess.TimeoutExpired:
+            raise NetError("nmcli timed out")
+        if r.returncode != 0:
+            raise NetError((r.stderr or r.stdout).strip() or "nmcli failed")
+        return r.stdout
+
+    def _fields(self, args):
+        d = {}
+        for line in self._run(args).splitlines():
+            parts = _nm_split(line)
+            if len(parts) >= 2:
+                d.setdefault(parts[0], parts[1])
+        return d
+
+    def _wifi_conn(self):
+        for line in self._run(["-t", "-f", "NAME,UUID,TYPE,DEVICE", "connection", "show", "--active"]).splitlines():
+            name, uuid, ctype, dev = (_nm_split(line) + ["", "", "", ""])[:4]
+            if ctype == "802-11-wireless" and dev:
+                return {"name": name, "uuid": uuid, "device": dev}
+        return None
+
+    def _laser_net(self):
+        """The laser's Ethernet subnet (LBBDirect), so WiFi can't be put on it."""
+        import ipaddress
+        try:
+            v = self._fields(["-t", "-f", "ipv4.addresses", "connection", "show", "LBBDirect"]).get("ipv4.addresses", "")
+            return ipaddress.ip_interface(v.split(",")[0].strip()).network if v else None
+        except (NetError, ValueError):
+            return None
+
+    # ------------------------------------------------------------ state
+    def _pending(self):
+        try:
+            with open(self.pending_path) as f:
+                return json.load(f)
+        except (OSError, ValueError):
+            return None
+
+    def info(self):
+        try:
+            conn = self._wifi_conn()
+        except NetError as e:
+            return {"available": False, "error": str(e)}
+        if not conn:
+            return {"available": False, "error": "No active WiFi connection"}
+        cfg = self._fields(["-t", "-f", "ipv4.method,ipv4.addresses,ipv4.gateway,ipv4.dns",
+                            "connection", "show", conn["uuid"]])
+        live = self._fields(["-t", "-f", "IP4.ADDRESS,IP4.GATEWAY,IP4.DNS", "device", "show", conn["device"]])
+        addr = live.get("IP4.ADDRESS[1]", "")
+        p = self._pending()
+        return {
+            "available": True,
+            "connection": conn["name"],
+            "device": conn["device"],
+            "method": "static" if cfg.get("ipv4.method") == "manual" else "dhcp",
+            "address": addr.split("/")[0] if addr else "",
+            "prefix": int(addr.split("/")[1]) if "/" in addr else 24,
+            "gateway": live.get("IP4.GATEWAY", "") or cfg.get("ipv4.gateway", ""),
+            "dns": live.get("IP4.DNS[1]", ""),
+            "pending": {"deadline": p["deadline"], "remaining": max(0, int(p["deadline"] - time.time())),
+                        "target": p.get("target")} if p else None,
+            "last_error": self.last_error,
+            "dry_run": self.dry,
+        }
+
+    # ------------------------------------------------------------ change
+    def apply(self, req):
+        import ipaddress
+        with self.lock:
+            if self._pending():
+                raise NetError("A network change is waiting for confirmation - confirm or revert it first")
+            conn = self._wifi_conn()
+            if not conn:
+                raise NetError("No active WiFi connection to configure")
+            cur = self._fields(["-t", "-f", "ipv4.method,ipv4.addresses,ipv4.gateway,ipv4.dns",
+                                "connection", "show", conn["uuid"]])
+            live = self._fields(["-t", "-f", "IP4.ADDRESS", "device", "show", conn["device"]])
+            cur_ip = live.get("IP4.ADDRESS[1]", "").split("/")[0]
+
+            mode = req.get("mode")
+            if mode == "dhcp":
+                new = {"ipv4.method": "auto", "ipv4.addresses": "", "ipv4.gateway": "", "ipv4.dns": ""}
+                target = None
+            elif mode == "static":
+                try:
+                    prefix = int(req.get("prefix", 24))
+                    iface = ipaddress.ip_interface("%s/%d" % (str(req.get("address", "")).strip(), prefix))
+                    gw = ipaddress.ip_address(str(req.get("gateway", "")).strip())
+                    dns = [ipaddress.ip_address(x.strip()) for x in str(req.get("dns", "")).replace(";", ",").split(",") if x.strip()]
+                except ValueError as e:
+                    raise NetError("Invalid address: %s" % e)
+                if iface.version != 4 or not (8 <= prefix <= 30):
+                    raise NetError("Use an IPv4 address with a subnet prefix between /8 and /30")
+                ip, net = iface.ip, iface.network
+                if ip in (net.network_address, net.broadcast_address):
+                    raise NetError("%s is the network/broadcast address of %s" % (ip, net))
+                if gw not in net or gw == ip:
+                    raise NetError("Gateway %s must be a different address inside %s" % (gw, net))
+                laser = self._laser_net()
+                if laser and ip in laser:
+                    raise NetError("%s is on the laser's Ethernet subnet (%s) - pick an address on your WiFi network" % (ip, laser))
+                if str(ip) != cur_ip and self._in_use(str(ip)):
+                    raise NetError("%s is already used by another device on the network" % ip)
+                new = {"ipv4.method": "manual", "ipv4.addresses": "%s/%d" % (ip, prefix),
+                       "ipv4.gateway": str(gw), "ipv4.dns": ",".join(str(d) for d in (dns or [gw]))}
+                target = str(ip)
+            else:
+                raise NetError("mode must be 'dhcp' or 'static'")
+
+            previous = {k: cur.get(k, "") for k in ("ipv4.method", "ipv4.addresses", "ipv4.gateway", "ipv4.dns")}
+            if previous["ipv4.method"] not in ("auto", "manual"):
+                previous["ipv4.method"] = "auto"
+            token = secrets.token_hex(6)
+            pend = {"uuid": conn["uuid"], "device": conn["device"], "previous": previous, "new": new,
+                    "target": target, "from_ip": cur_ip, "deadline": time.time() + NET_CONFIRM_SECONDS,
+                    "token": token}
+            self._write_pending(pend)
+            # apply shortly after replying so the browser gets the answer first
+            threading.Timer(1.5, self._apply_if_pending, [token]).start()
+            self._arm(NET_CONFIRM_SECONDS)
+            log("network change to", new, "- waiting for confirmation")
+            return {"target": target, "confirm_seconds": NET_CONFIRM_SECONDS}
+
+    def confirm(self):
+        with self.lock:
+            if not self._pending():
+                raise NetError("No network change is waiting for confirmation")
+            self._clear()
+            log("network change confirmed")
+
+    def revert(self, reason="reverted"):
+        with self.lock:
+            p = self._pending()
+            if not p:
+                raise NetError("No network change to revert")
+            self._clear()
+        log("reverting network change:", reason)
+        if p.get("applied"):
+            self._set(p["uuid"], p["device"], p["previous"])
+
+    def _apply_if_pending(self, token):
+        """Delayed apply - skipped if the change was reverted/replaced in the meantime."""
+        with self.lock:
+            p = self._pending()
+            if not p or p.get("token") != token:
+                log("network change was cancelled before it was applied")
+                return
+            p["applied"] = True
+            self._write_pending(p)
+        self._set(p["uuid"], p["device"], p["new"])
+
+    def _set(self, uuid, device, settings):
+        args = ["connection", "modify", uuid]
+        for k in ("ipv4.method", "ipv4.addresses", "ipv4.gateway", "ipv4.dns"):
+            args += [k, settings.get(k, "")]
+        # going to DHCP: clear static values first or nmcli rejects 'auto' with addresses set
+        try:
+            if settings.get("ipv4.method") == "auto":
+                self._run(["connection", "modify", uuid, "ipv4.addresses", "", "ipv4.gateway", ""], write=True)
+            self._run(args, write=True)
+            try:
+                self._run(["device", "reapply", device], write=True, timeout=30)
+            except NetError:
+                self._run(["connection", "up", uuid], write=True, timeout=45)
+            self.last_error = None
+        except NetError as e:
+            self.last_error = "Applying network settings failed: %s" % e
+            log(self.last_error)
+
+    def _in_use(self, ip):
+        try:
+            return subprocess.run(["ping", "-c", "2", "-W", "1", ip], stdout=subprocess.DEVNULL,
+                                  stderr=subprocess.DEVNULL, timeout=6).returncode == 0
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+
+    def _arm(self, seconds):
+        if self.timer:
+            self.timer.cancel()
+        self.timer = threading.Timer(seconds, self._expire)
+        self.timer.daemon = True
+        self.timer.start()
+
+    def _expire(self):
+        if self._pending():
+            try:
+                self.revert("not confirmed within %d s" % NET_CONFIRM_SECONDS)
+                self.last_error = "The new network settings weren't confirmed in time, so the previous ones were restored."
+            except NetError:
+                pass
+
+    def _write_pending(self, data):
+        tmp = self.pending_path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(data, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, self.pending_path)
+
+    def _clear(self):
+        if self.timer:
+            self.timer.cancel()
+            self.timer = None
+        try:
+            os.unlink(self.pending_path)
+        except FileNotFoundError:
+            pass
+
+
 # ======================================================================== camera
 
 
@@ -1021,7 +1289,7 @@ def local_ips():
     return ips
 
 
-def make_handler(cam, cfg, dashboard, updater):
+def make_handler(cam, cfg, dashboard, updater, net=None):
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.0"
         server_version = "lbcam/" + VERSION
@@ -1088,6 +1356,8 @@ def make_handler(cam, cfg, dashboard, updater):
                 return self._json(cam.controls())
             if p == "/api/update":
                 return self._json(updater.info())
+            if p == "/api/network":
+                return self._json(net.info() if net else {"available": False, "error": "disabled"})
             self._send(404, "text/plain", b"not found", head)
 
         def do_POST(self):
@@ -1098,6 +1368,14 @@ def make_handler(cam, cfg, dashboard, updater):
             if body is None:
                 return self._json({"error": "invalid JSON"}, 400)
             try:
+                if p == "/api/network":
+                    return self._json(dict(ok=True, **net.apply(body)))
+                if p == "/api/network/confirm":
+                    net.confirm()
+                    return self._json({"ok": True})
+                if p == "/api/network/revert":
+                    net.revert("reverted from dashboard")
+                    return self._json({"ok": True})
                 if p == "/api/update/password":
                     updater.set_password(str(body.get("new") or ""), body.get("current"))
                     return self._json({"ok": True})
@@ -1126,7 +1404,7 @@ def make_handler(cam, cfg, dashboard, updater):
                 if p == "/api/restart":
                     cam.reopen.set()
                     return self._json({"ok": True})
-            except UpdateError as e:
+            except (UpdateError, NetError) as e:
                 return self._json({"error": str(e)}, 400)
             except PermissionError as e:
                 return self._json({"error": str(e)}, 403)
@@ -1179,6 +1457,7 @@ def make_handler(cam, cfg, dashboard, updater):
                 "cameras": list_cameras(),
                 "uptime": int(time.time() - cam.started),
                 "ips": local_ips(),
+                "hostname": socket.gethostname(),
                 "placeholder": bool(cam.placeholder),
             })
             return s
@@ -1256,12 +1535,13 @@ def main():
 
     cam = Camera(cfg, placeholder)
     updater = Updater(cfg)
+    net = Network()
     threading.Thread(target=cam.run, daemon=True).start()
 
     srv = None
     for attempt in range(30):
         try:
-            srv = ThreadingHTTPServer(("0.0.0.0", port), make_handler(cam, cfg, dashboard, updater))
+            srv = ThreadingHTTPServer(("0.0.0.0", port), make_handler(cam, cfg, dashboard, updater, net))
             break
         except OSError as e:
             log("port %d unavailable (%s), retrying..." % (port, e))

@@ -91,7 +91,8 @@ button:disabled{opacity:.5;cursor:default}
         <div class="url"><input type="text" id="urlStream" readonly><button data-copy="urlStream">Copy</button></div>
         <label>Snapshot</label>
         <div class="url"><input type="text" id="urlSnap" readonly><button data-copy="urlSnap">Copy</button></div>
-        <div class="hint">Reserve this IP in your router so the address doesn't change. Re-run LightBurn's lens calibration and camera alignment after changing camera or resolution.</div>
+        <div class="hint" id="urlHint"></div>
+        <div class="hint">Re-run LightBurn's lens calibration and camera alignment after changing camera or resolution.</div>
       </div>
     </div>
   </section>
@@ -126,6 +127,42 @@ button:disabled{opacity:.5;cursor:default}
     <div class="panel">
       <h2>Status</h2>
       <div class="body"><dl class="kv" id="kv"></dl></div>
+    </div>
+
+    <div class="panel">
+      <h2>Network</h2>
+      <div class="body">
+        <div class="banner" id="netPending"></div>
+        <div id="netForm" hidden>
+          <dl class="kv" id="netkv"></dl>
+          <label for="netMode">IP address</label>
+          <select id="netMode">
+            <option value="dhcp">Automatic (DHCP from router)</option>
+            <option value="static">Static</option>
+          </select>
+          <div id="netStatic" hidden>
+            <div class="row">
+              <div><label for="netAddr">Address</label><input type="text" id="netAddr" placeholder="192.168.1.50" inputmode="decimal"></div>
+              <div><label for="netPrefix">Subnet</label>
+                <select id="netPrefix">
+                  <option value="24">255.255.255.0 (/24)</option>
+                  <option value="16">255.255.0.0 (/16)</option>
+                  <option value="23">255.255.254.0 (/23)</option>
+                  <option value="22">255.255.252.0 (/22)</option>
+                  <option value="25">255.255.255.128 (/25)</option>
+                </select></div>
+            </div>
+            <div class="row">
+              <div><label for="netGw">Gateway (router)</label><input type="text" id="netGw" inputmode="decimal"></div>
+              <div><label for="netDns">DNS</label><input type="text" id="netDns" inputmode="decimal"></div>
+            </div>
+            <div class="hint">Pick an address outside your router's DHCP range so nothing else gets it.</div>
+          </div>
+          <div class="actions"><button class="primary" id="netApply">Apply</button></div>
+          <div class="hint">WiFi only; the laser's Ethernet link isn't touched. After applying you have 90 seconds to confirm from the new address, otherwise the old settings come back automatically.</div>
+        </div>
+        <div class="empty" id="netNA" hidden></div>
+      </div>
     </div>
 
     <div class="panel">
@@ -241,10 +278,16 @@ function renderBanner(s){
 }
 
 function renderUrls(s){
-  const host = location.hostname || (s.ips[0] || "bridge");
+  // Prefer the .local name: it keeps working if the router hands the Bridge a new IP.
   const port = location.port ? ":" + location.port : "";
+  const local = s.hostname ? `${s.hostname}.local` : "";
+  const ip = s.ips[0] || location.hostname;
+  const host = local || ip;
   $("#urlStream").value = `http://${host}${port}/stream`;
   $("#urlSnap").value = `http://${host}${port}/snapshot.jpg`;
+  $("#urlHint").innerHTML = local && ip
+    ? `Uses the Bridge's network name, so it keeps working if its IP changes. If LightBurn can't connect, use the IP instead: <code>http://${esc(ip)}${port}/stream</code>`
+    : "Reserve this IP in your router so the address doesn't change.";
 }
 
 function renderStatus(s){
@@ -463,9 +506,72 @@ $("#rbGo").addEventListener("click", async () => {
   } catch(e) { toast(e.message, true); }
 });
 
+/* ---------- network (static IP) ---------- */
+let net = null, netDirty = false, netTick = null;
+async function loadNet(){
+  try { net = await api("/api/network"); } catch(e) { return; }
+  const na = $("#netNA"), form = $("#netForm");
+  if (!net.available) { na.hidden = false; na.textContent = "Network settings unavailable: " + (net.error || "unknown"); form.hidden = true; return; }
+  na.hidden = true; form.hidden = false;
+  $("#netkv").innerHTML = [["WiFi", net.connection], ["Address", net.address ? `${net.address}/${net.prefix}` : "—"],
+    ["Gateway", net.gateway || "—"], ["Mode", net.method === "static" ? "Static" : "DHCP"]]
+    .concat(net.dry_run ? [["Test mode", "changes are only logged"]] : [])
+    .map(([a,b]) => `<dt>${esc(a)}</dt><dd>${esc(b)}</dd>`).join("");
+  if (!netDirty) {
+    $("#netMode").value = net.method;
+    $("#netAddr").value = net.method === "static" ? net.address : "";
+    $("#netAddr").placeholder = net.address || "192.168.1.50";
+    if ([...$("#netPrefix").options].some(o => o.value === String(net.prefix))) $("#netPrefix").value = String(net.prefix);
+    $("#netGw").value = net.gateway; $("#netDns").value = net.dns || net.gateway;
+    $("#netStatic").hidden = net.method !== "static";
+  }
+  renderNetPending();
+}
+function renderNetPending(){
+  const b = $("#netPending"), p = net && net.pending;
+  clearInterval(netTick);
+  if (p) {
+    let left = p.remaining;
+    const draw = () => {
+      b.className = "banner show warn";
+      b.innerHTML = `<b>Keep these network settings?</b>The Bridge reverts to the previous settings in <b>${Math.max(0, left)} s</b> unless you confirm.
+        <div class="actions"><button class="primary" id="netKeep">Keep settings</button><button id="netRevert">Revert now</button></div>`;
+      $("#netKeep").onclick = async () => { try { await api("/api/network/confirm", {}); toast("Network settings kept"); netDirty = false; loadNet(); } catch(e) { toast(e.message, true); } };
+      $("#netRevert").onclick = async () => { try { await api("/api/network/revert", {}); toast("Reverting…"); } catch(e) { toast(e.message, true); } };
+    };
+    draw(); netTick = setInterval(() => { left--; if (left < 0) { clearInterval(netTick); loadNet(); } else b.querySelector("b:nth-of-type(2)").textContent = left + " s"; }, 1000);
+  } else if (net && net.last_error) {
+    b.className = "banner show bad"; b.innerHTML = `<b>Network</b>${esc(net.last_error)}`;
+  } else { b.className = "banner"; b.innerHTML = ""; }
+}
+$("#netMode").addEventListener("change", e => { netDirty = true; $("#netStatic").hidden = e.target.value !== "static"; });
+["#netAddr", "#netPrefix", "#netGw", "#netDns"].forEach(s => $(s).addEventListener("input", () => netDirty = true));
+$("#netApply").addEventListener("click", async () => {
+  const mode = $("#netMode").value;
+  const body = mode === "static"
+    ? {mode, address: $("#netAddr").value.trim(), prefix: Number($("#netPrefix").value), gateway: $("#netGw").value.trim(), dns: $("#netDns").value.trim()}
+    : {mode};
+  const host = (state && state.hostname) ? state.hostname + ".local" : "";
+  const port = location.port ? ":" + location.port : "";
+  const dest = mode === "static" ? body.address : (host || location.hostname);
+  if (!confirm(`Apply network change?\n\nThe Bridge will move to ${dest}. This page will try to open it there; confirm within 90 s or it switches back.`)) return;
+  const btn = $("#netApply"); btn.disabled = true;
+  try {
+    const r = await api("/api/network", body);
+    const url = `http://${r.target || host || location.hostname}${port}/`;
+    busy = true; setPill("warn", "Changing network…");
+    toast("Applying — opening " + url);
+    $("#netPending").className = "banner show warn";
+    $("#netPending").innerHTML = `<b>Switching network…</b>Opening <a href="${esc(url)}">${esc(url)}</a>. If it doesn't load, the Bridge goes back to ${esc(location.host)} in 90 s.`;
+    setTimeout(() => { location.href = url; }, r.target && r.target === location.hostname ? 1500 : 7000);
+  } catch(e) { toast(e.message, true); btn.disabled = false; }
+});
+
 startPreview();
 poll();
 loadSw();
+loadNet();
+setInterval(() => { if (!busy) loadNet(); }, 10000);
 setInterval(() => { if (!busy) loadSw(); }, 15000);
 </script>
 </body>

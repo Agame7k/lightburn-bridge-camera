@@ -66,6 +66,11 @@ button:disabled{opacity:.5;cursor:default}
 .url{display:flex;gap:6px;margin-top:6px}
 .url input{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}
 .empty{color:var(--muted);font-size:13px}
+details.panel summary{cursor:pointer;list-style:none}
+details.panel summary::-webkit-details-marker{display:none}
+details.panel summary h2::after{content:" ▸";font-size:11px}
+details.panel[open] summary h2::after{content:" ▾"}
+#logText{margin:0;max-height:340px;overflow:auto;background:var(--field);border:1px solid var(--line);border-radius:7px;padding:10px;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;overflow-wrap:anywhere}
 #toast{position:fixed;right:16px;bottom:16px;background:var(--text);color:var(--bg);padding:9px 14px;border-radius:8px;font-size:13px;opacity:0;transform:translateY(8px);transition:.2s;pointer-events:none;max-width:calc(100vw - 32px)}
 #toast.show{opacity:1;transform:none}
 #toast.err{background:var(--bad);color:#fff}
@@ -95,6 +100,13 @@ button:disabled{opacity:.5;cursor:default}
         <div class="hint">Re-run LightBurn's lens calibration and camera alignment after changing camera or resolution.</div>
       </div>
     </div>
+    <details class="panel" id="logPanel" style="margin-top:16px">
+      <summary><h2 style="display:inline-block;padding:12px 14px">Log</h2></summary>
+      <div class="body" style="padding-top:0">
+        <pre id="logText">Loading…</pre>
+        <div class="actions"><button id="logCopy">Copy log</button><span class="hint" id="logSrc" style="margin:0;align-self:center"></span></div>
+      </div>
+    </details>
   </section>
 
   <aside class="side">
@@ -206,7 +218,7 @@ function toast(msg, err){
   clearTimeout(toast.t); toast.t = setTimeout(() => t.className = "", 2600);
 }
 async function api(path, body){
-  const opt = body === undefined ? {} : {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body)};
+  const opt = body === undefined ? {} : {method:"POST", headers:{"Content-Type":"application/json", "X-LBCam":"1"}, body:JSON.stringify(body)};
   const r = await fetch(path, opt);
   const j = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error(j.error || ("HTTP " + r.status));
@@ -237,7 +249,7 @@ function setPill(kind, text){ $("#pill").className = "pill " + kind; $("#pilltex
 function render(){
   const s = state, cam = s.camera || {};
   $("#ver").textContent = "v" + s.version;
-  const map = {streaming:["ok","Live"], searching:["warn","No camera"], error:["bad","Camera error"], starting:["warn","Starting…"]};
+  const map = {streaming:["ok","Live"], idle:["ok","Paused"], searching:["warn","No camera"], error:["bad","Camera error"], starting:["warn","Starting…"]};
   const [k, t] = map[s.state] || ["warn", s.state];
   setPill(k, t);
 
@@ -488,7 +500,7 @@ $("#upGo").addEventListener("click", async () => {
   const btn = $("#upGo"); btn.disabled = true; btn.textContent = "Uploading…";
   try {
     const r = await fetch("/api/update", {method: "POST", body: f,
-      headers: {"Content-Type": "application/octet-stream", "X-Password": $("#upPw").value}});
+      headers: {"Content-Type": "application/octet-stream", "X-LBCam": "1", "X-Password": $("#upPw").value}});
     const j = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error(j.error || ("HTTP " + r.status));
     toast("Installed " + j.version + " — restarting");
@@ -572,6 +584,24 @@ poll();
 loadSw();
 loadNet();
 setInterval(() => { if (!busy) loadNet(); }, 10000);
+
+/* ---------- log ---------- */
+async function loadLog(){
+  if (!$("#logPanel").open) return;
+  try {
+    const j = await api("/api/logs?n=300"), pre = $("#logText");
+    const atBottom = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 20;
+    pre.textContent = j.lines.join("\n") || "(empty)";
+    if (atBottom) pre.scrollTop = pre.scrollHeight;
+    $("#logSrc").textContent = j.source === "journal" ? "Service log (includes updates and restarts)" : "This session's log";
+  } catch(e) { $("#logText").textContent = "Couldn't load the log: " + e.message; }
+}
+$("#logPanel").addEventListener("toggle", () => { if ($("#logPanel").open) { loadLog(); const p = $("#logText"); setTimeout(() => p.scrollTop = p.scrollHeight, 300); } });
+$("#logCopy").addEventListener("click", async () => {
+  const t = $("#logText").textContent;
+  try { await navigator.clipboard.writeText(t); toast("Log copied"); } catch(e) { toast("Select the text and copy it manually", true); }
+});
+setInterval(loadLog, 3000);
 setInterval(() => { if (!busy) loadSw(); }, 15000);
 </script>
 </body>

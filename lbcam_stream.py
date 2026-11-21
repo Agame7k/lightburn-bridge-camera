@@ -33,6 +33,7 @@ import re
 import secrets
 import select
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -42,7 +43,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "2.4"
+VERSION = "2.5"
 LBCAM_HOME = os.environ.get("LBCAM_HOME", "/opt/lbcam")
 
 # ======================================================================== V4L2
@@ -227,8 +228,29 @@ VIDIOC_ENUM_FRAMEINTERVALS = _IOWR("V", 75, v4l2_frmivalenum)
 # ======================================================================== helpers
 
 
+import collections
+
+LOG_LINES = collections.deque(maxlen=400)  # recent log for the dashboard
+
+
 def log(*a):
-    print(time.strftime("%H:%M:%S"), *a, flush=True)
+    line = " ".join([time.strftime("%H:%M:%S")] + [str(x) for x in a])
+    LOG_LINES.append(line)
+    print(line, flush=True)
+
+
+def recent_log(n=300):
+    """Service log incl. launcher/update messages (journald on the Bridge), else this process's lines."""
+    n = max(1, min(int(n), 1000))
+    try:
+        r = subprocess.run(["journalctl", "-u", "lbcam", "-n", str(n), "--no-pager", "-o", "cat"],
+                           stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, universal_newlines=True, timeout=5)
+        lines = [l for l in r.stdout.splitlines() if l.strip() and not l.startswith("-- ")]
+        if r.returncode == 0 and lines:
+            return {"source": "journal", "lines": lines}
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return {"source": "process", "lines": list(LOG_LINES)[-n:]}
 
 
 def querycap(fd):
@@ -283,6 +305,27 @@ def list_cameras():
         finally:
             os.close(fd)
     return cams
+
+
+_cam_cache = {"t": 0.0, "nodes": None, "list": []}
+_cam_cache_lock = threading.Lock()
+CAMERA_CACHE_SECONDS = 10.0
+
+
+def cameras_cached(max_age=CAMERA_CACHE_SECONDS):
+    """
+    list_cameras() for the dashboard's polling, reused for up to max_age seconds.
+    Refreshed immediately when /dev/video* nodes appear/disappear (plug/unplug).
+    """
+    nodes = tuple(sorted(glob.glob("/dev/video*")))
+    with _cam_cache_lock:
+        c = _cam_cache
+        if c["nodes"] == nodes and time.time() - c["t"] < max_age:
+            return c["list"]
+    fresh = list_cameras()
+    with _cam_cache_lock:
+        _cam_cache.update(t=time.time(), nodes=nodes, list=fresh)
+    return fresh
 
 
 def resolve_device(dev_id):
@@ -443,6 +486,8 @@ class Config:
         }
         self.load_error = None
         self.save_error = None
+        self._written = None   # last JSON written, to skip identical writes
+        self._timer = None     # pending batched save
         try:
             with open(path) as f:
                 saved = json.load(f)
@@ -467,11 +512,28 @@ class Config:
     def set_control(self, cam_id, cid, value):
         with self.lock:
             self.data["controls"].setdefault(cam_id, {})[str(cid)] = int(value)
-            self._save()
+            self._save_later()
 
     def clear_controls(self, cam_id):
         with self.lock:
             self.data["controls"].pop(cam_id, None)
+            self._save_later()
+
+    SAVE_DELAY = 3.0  # seconds; slider drags become one write instead of dozens
+
+    def _save_later(self):
+        """Batch frequent changes (image controls) into one write - easier on the SD card."""
+        if self._timer is None:
+            self._timer = threading.Timer(self.SAVE_DELAY, self.flush)
+            self._timer.daemon = True
+            self._timer.start()
+
+    def flush(self):
+        """Write any batched changes now (also called on shutdown)."""
+        with self.lock:
+            if self._timer is not None:
+                self._timer.cancel()
+                self._timer = None
             self._save()
 
     def controls_for(self, cam_id):
@@ -487,13 +549,20 @@ class Config:
         return d
 
     def _save(self):
+        text = json.dumps(self.data, indent=2)
+        if text == self._written:
+            return  # nothing changed - don't touch the SD card
+        if self._timer is not None:  # an immediate save covers any batched one
+            self._timer.cancel()
+            self._timer = None
         tmp = self.path + ".tmp"
         try:
             with open(tmp, "w") as f:
-                json.dump(self.data, f, indent=2)
+                f.write(text)
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(tmp, self.path)
+            self._written = text
             self.save_error = None
         except Exception as e:
             self.save_error = "could not save settings to %s: %s" % (self.path, e)
@@ -707,7 +776,12 @@ class Updater:
             os.fsync(f.fileno())
         os.replace(tmp, os.path.join(home, "pending.json"))
         log("switching to", version, "- restarting")
-        threading.Timer(1.0, os._exit, [0]).start()  # launcher starts + health-checks the new one
+        threading.Timer(1.0, self.restart).start()  # launcher starts + health-checks the new one
+
+    def restart(self):
+        """Exit so the launcher starts the new current release (tests replace this)."""
+        self.cfg.flush()
+        os._exit(0)
 
     def _prune(self, keep=3):
         rel = os.path.join(self.home, "releases")
@@ -996,7 +1070,7 @@ class Camera:
     def __init__(self, cfg, placeholder):
         self.cfg = cfg
         self.placeholder = placeholder
-        self.state = "starting"  # starting | searching | streaming | error
+        self.state = "starting"  # starting | searching | streaming | idle | error
         self.message = ""
         self.info = {}
         self.cam_id = None
@@ -1013,6 +1087,10 @@ class Camera:
         self.clients_lock = threading.Lock()
         self.started = time.time()
         self.last_error_time = None
+        # pause the camera when nobody watches (0 disables)
+        self.idle_after = float(os.environ.get("CAM_IDLE_SECONDS", "30"))
+        self.last_use = time.time()
+        self.wake = threading.Event()
 
     # ------------------------------------------------------------ state
 
@@ -1029,6 +1107,24 @@ class Camera:
             self.frame_id += 1
             self.live = live
             self.cond.notify_all()
+
+    def touch(self):
+        """Someone wants frames: keep the camera running / wake it up."""
+        self.last_use = time.time()
+        self.wake.set()
+
+    def is_idle(self):
+        return (self.idle_after > 0 and self.clients == 0
+                and time.time() - self.last_use > self.idle_after)
+
+    def latest_frame(self, timeout=5.0):
+        """Current frame, waiting for a fresh one if the camera is just waking up."""
+        self.touch()
+        fid, frame = self.wait_frame(-1, 0)
+        deadline = time.time() + timeout
+        while frame is None and time.time() < deadline:
+            fid, frame = self.wait_frame(fid, max(0.05, deadline - time.time()))
+        return frame
 
     def wait_frame(self, last_id, timeout=5.0):
         with self.cond:
@@ -1178,8 +1274,9 @@ class Camera:
                 self.fd, self.cam_id = fd, cam_id
             self._set("streaming", note or "")
             log("streaming", self.info)
+            went_idle = False
             try:
-                self._loop(fd, maps)
+                went_idle = self._loop(fd, maps)
                 if self.reopen.is_set():
                     self._set("starting", "Applying new settings")
             except Exception as e:
@@ -1191,13 +1288,29 @@ class Camera:
                     self.fd = None
                     self._close(fd, maps)
                 self.fps_measured = 0.0
+            if went_idle:
+                self._sleep_until_needed()
+                continue
             if not self.reopen.is_set():
                 self._idle(1)
 
+    def _sleep_until_needed(self):
+        """Camera closed because nobody is watching; reopen when a viewer/snapshot arrives."""
+        self._set("idle", "Paused - nobody is watching (wakes up on the next viewer)")
+        with self.cond:
+            self.frame, self.live = None, False  # don't hand out a stale frame later
+        while self.running and not self.reopen.is_set() and self.is_idle():
+            self.wake.wait(1.0)
+            self.wake.clear()
+        self._set("starting", "Waking up")
+
     def _loop(self, fd, maps):
+        """Capture until stopped. Returns True if it stopped because nobody is watching."""
         count, t0 = 0, time.time()
         bad = 0
         while self.running and not self.reopen.is_set():
+            if self.is_idle():
+                return True
             r, _, _ = select.select([fd], [], [], 3.0)
             if not r:
                 raise RuntimeError("no frames from camera for 3 s")
@@ -1217,6 +1330,7 @@ class Camera:
             if now - t0 >= 2.0:
                 self.fps_measured = round(count / (now - t0), 1)
                 count, t0 = 0, now
+        return False
 
     # ------------------------------------------------------------ controls
 
@@ -1270,6 +1384,7 @@ class Camera:
     def client(self, delta):
         with self.clients_lock:
             self.clients += delta
+        self.touch()
 
 
 # ======================================================================== HTTP
@@ -1289,6 +1404,30 @@ def local_ips():
     return ips
 
 
+def host_allowed(host_header, extra=None):
+    """
+    Accept only requests addressed to this device: an IP, localhost, a .local name, or this
+    host's name. Blocks DNS-rebinding (evil.example resolving to the Bridge's IP).
+    """
+    import ipaddress
+    if not host_header:
+        return True  # HTTP/1.0 clients without Host
+    h = host_header.strip().lower()
+    if h.startswith("["):  # [IPv6]:port
+        h = h[1:h.find("]")] if "]" in h else h
+    elif h.count(":") == 1:
+        h = h.split(":")[0]
+    try:
+        ipaddress.ip_address(h)
+        return True
+    except ValueError:
+        pass
+    me = socket.gethostname().lower()
+    allowed = {"localhost", me, me + ".local"}
+    allowed.update(x.strip().lower() for x in (extra or os.environ.get("CAM_ALLOWED_HOSTS", "")).split(",") if x.strip())
+    return h in allowed or h.endswith(".local")
+
+
 def make_handler(cam, cfg, dashboard, updater, net=None):
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.0"
@@ -1303,7 +1442,7 @@ def make_handler(cam, cfg, dashboard, updater, net=None):
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-cache, no-store")
-            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("X-Content-Type-Options", "nosniff")
             self.end_headers()
             if not head:
                 self.wfile.write(body)
@@ -1320,7 +1459,25 @@ def make_handler(cam, cfg, dashboard, updater, net=None):
             except ValueError:
                 return None
 
+        def _guard(self, changing):
+            """None if the request may proceed, else an error message (sent as 403)."""
+            if not host_allowed(self.headers.get("Host")):
+                return "Host not allowed"
+            if changing:
+                # Custom header => browsers need a CORS preflight for cross-site requests,
+                # which this server never approves. Blocks CSRF from other websites.
+                if self.headers.get("X-LBCam") != "1":
+                    return "Missing X-LBCam header (requests must come from the dashboard)"
+                origin = self.headers.get("Origin")
+                if origin and origin != "null":
+                    if urlparse(origin).netloc.lower() != (self.headers.get("Host") or "").lower():
+                        return "Cross-site request blocked"
+            return None
+
         # ---------------------------------------------------- routes
+        def do_OPTIONS(self):
+            self._send(403, "text/plain", b"cross-origin requests are not allowed")
+
         def do_HEAD(self):
             self._route(head=True)
 
@@ -1328,6 +1485,9 @@ def make_handler(cam, cfg, dashboard, updater, net=None):
             self._route(head=False)
 
         def _route(self, head):
+            err = self._guard(False)
+            if err:
+                return self._send(403, "text/plain", err.encode(), head)
             u = urlparse(self.path)
             p = u.path.rstrip("/") or "/"
             if p in ("/", "/index.html"):
@@ -1337,9 +1497,9 @@ def make_handler(cam, cfg, dashboard, updater, net=None):
                     return self._send(200, "multipart/x-mixed-replace; boundary=" + BOUNDARY, b"", True)
                 return self._stream()
             if p in ("/snapshot", "/snapshot.jpg", "/image.jpg", "/jpg"):
-                _, frame = cam.wait_frame(-1, 0)
-                if frame is None:
-                    _, frame = cam.wait_frame(0, 3)
+                if head:  # URL checks (LightBurn) shouldn't wake the camera or ever fail
+                    return self._send(200, "image/jpeg", b"", True)
+                frame = cam.latest_frame(5)
                 if frame is None:
                     return self._send(503, "text/plain", b"camera starting", head)
                 return self._send(200, "image/jpeg", frame, head)
@@ -1348,7 +1508,7 @@ def make_handler(cam, cfg, dashboard, updater, net=None):
             if p == "/api/state":
                 return self._json(self._state())
             if p == "/api/cameras":
-                return self._json(list_cameras())
+                return self._json(cameras_cached())
             if p == "/api/modes":
                 dev = (parse_qs(u.query).get("device") or [None])[0]
                 return self._json(cam.modes(dev if dev and dev != "auto" else None))
@@ -1358,9 +1518,18 @@ def make_handler(cam, cfg, dashboard, updater, net=None):
                 return self._json(updater.info())
             if p == "/api/network":
                 return self._json(net.info() if net else {"available": False, "error": "disabled"})
+            if p == "/api/logs":
+                try:
+                    n = int((parse_qs(u.query).get("n") or ["300"])[0])
+                except ValueError:
+                    n = 300
+                return self._json(recent_log(n))
             self._send(404, "text/plain", b"not found", head)
 
         def do_POST(self):
+            err = self._guard(True)
+            if err:
+                return self._json({"error": err}, 403)
             p = urlparse(self.path).path.rstrip("/")
             if p == "/api/update":
                 return self._upload()
@@ -1454,7 +1623,7 @@ def make_handler(cam, cfg, dashboard, updater, net=None):
             s.update({
                 "version": VERSION,
                 "config": cfg.public(),
-                "cameras": list_cameras(),
+                "cameras": cameras_cached(),
                 "uptime": int(time.time() - cam.started),
                 "ips": local_ips(),
                 "hostname": socket.gethostname(),
@@ -1467,7 +1636,6 @@ def make_handler(cam, cfg, dashboard, updater, net=None):
             self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=" + BOUNDARY)
             self.send_header("Cache-Control", "no-cache, no-store, private")
             self.send_header("Pragma", "no-cache")
-            self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
             cam.client(+1)
             log("client connected", self.client_address[0])
@@ -1550,12 +1718,18 @@ def main():
         log("giving up: port %d stays busy" % port)
         return 1
     srv.daemon_threads = True
+
+    def on_term(signum, frame):
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM, on_term)  # systemd stop -> write batched settings first
+
     log("lbcam %s on port %d, settings: %s" % (VERSION, port, cfg_path))
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
         pass
     cam.running = False
+    cfg.flush()
     return 0
 
 

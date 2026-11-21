@@ -19,10 +19,13 @@ USB camera ─▶ LightBurn Bridge (lbcam, port 8080) ─WiFi─▶ LightBurn "n
   - camera picker, resolution and frame rate dropdowns showing what the camera actually supports
   - image controls (exposure, focus, white balance, …), applied live and saved per camera
   - copyable URLs for LightBurn
+  - log viewer (the service journal), static IP settings
 - **Handles a missing camera**: while no camera is working, LightBurn gets a
   "Camera not connected" image instead of a dead stream. Live video returns automatically
   when one is plugged in. Errors are explained in the dashboard.
 - **Starts at boot**, survives crashes and camera unplug/replug.
+- **Pauses the camera when nobody is watching** (after 30 s, `CAM_IDLE_SECONDS`; `0`
+  turns it off). The next stream or snapshot request wakes it up in about a second.
 - **Updates in the field**: upload an update file in the dashboard. Each update is
   self-tested on the Bridge, health-checked after restart, and **rolled back automatically**
   if it fails. Optional update password.
@@ -145,6 +148,16 @@ sudo journalctl -u lbcam -f
 | `POST /api/network` | `{"mode":"dhcp"}` or `{"mode":"static","address","prefix","gateway","dns"}` |
 | `POST /api/network/confirm` | keep a pending change |
 | `POST /api/network/revert` | undo a pending change now |
+| `GET /api/logs?n=200` | recent log lines |
+
+Every `POST` needs the header `X-LBCam: 1`, and an `Origin` header (if sent) must match the
+Bridge's address. That stops other websites from changing settings through your browser.
+Requests must use the Bridge's IP, `localhost` or a `.local` name; add other names to
+`CAM_ALLOWED_HOSTS` (comma-separated) in `/boot/lbcam.env`.
+
+```
+curl -X POST -H 'X-LBCam: 1' http://lightburnbridge.local:8080/api/restart
+```
 
 ## Development
 
@@ -153,7 +166,12 @@ Runs on any Linux machine with a UVC webcam:
 ```
 python3 lbcam_stream.py              # http://localhost:8080, settings in ./lbcam.json
 python3 lbcam_stream.py --selftest
+python3 -m unittest discover -s tests -v   # no camera needed
+python3 make_update.py                     # builds lbcam-update-<version>.tar.gz
 ```
+
+GitHub Actions runs the tests on Python 3.7 (the Bridge's version) and 3.12. Pushing a tag
+`v<VERSION>` (e.g. `v2.5`) builds the update file and attaches it to a GitHub release.
 
 ## Project layout
 
@@ -167,6 +185,7 @@ python3 lbcam_stream.py --selftest
 | `patch_image.py` | adds lbcam to a Bridge `.img`/`.img.xz` offline |
 | `make_update.py` | builds an update file |
 | `upgrade_over_ssh.sh` | installs onto a running Bridge over SSH |
+| `tests/` | unit tests (standard library `unittest`) |
 
 ## Troubleshooting
 
@@ -176,6 +195,7 @@ python3 lbcam_stream.py --selftest
 | … does not support MJPEG | The camera is YUYV-only; use an MJPEG-capable camera. |
 | … is in use by another program | Restart camera, or reboot the Bridge. |
 | No frames from camera for 3 s | Usually power or cable. Retries automatically. |
+| Paused | Nobody is watching; it wakes on the next request. Not an error. |
 | Camera chose W×H | The camera doesn't support the requested size; pick one from the list. |
 
 Laggy or choppy: lower resolution or frame rate. Weak WiFi is the usual cause.
@@ -184,6 +204,8 @@ Laggy or choppy: lower resolution or frame rate. Weak WiFi is the usual cause.
 
 - Intended for a trusted local network. The stream and camera settings are open to anyone
   on the network. Software updates can be protected with the optional update password.
+- The API refuses cross-site requests and unknown host names (CSRF and DNS-rebinding
+  protection), so a web page you visit can't change the Bridge's settings.
 - **The stock Bridge image has SSH enabled with the default Raspberry Pi login and
   passwordless sudo.** Change it with `ssh pi@<bridge-ip> passwd`. That comes from the
   stock image, not from this project.

@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+
+# Local test settings (written next to the script when run on a PC)
+lbcam.json
+lbcam.json.tmp
+
+# Build outputs - LightBurn's Bridge image is not ours to redistribute
+*.img
+*.img.xz
+*.zip
+lbcam-update-*.tar.gz
+
+# OS / editor
+.DS_Store
+*.swp
+.vscode/
+.idea/

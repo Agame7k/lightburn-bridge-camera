@@ -1,0 +1,20 @@
+[Unit]
+Description=LightBurn Bridge USB camera stream + dashboard
+After=network.target
+
+[Service]
+Environment=CAM_WIDTH=1280
+Environment=CAM_HEIGHT=720
+Environment=CAM_FPS=15
+Environment=CAM_PORT=8080
+Environment=LBCAM_HOME=/opt/lbcam
+# Optional overrides you can edit from any computer (boot partition is FAT):
+EnvironmentFile=-/boot/lbcam.env
+# The launcher runs /opt/lbcam/current/lbcam_stream.py and rolls back failed updates.
+ExecStart=/usr/bin/python3 /opt/lbcam/launcher.py
+Restart=always
+RestartSec=3
+Nice=5
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,472 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bridge Camera</title>
+<style>
+:root{
+  --bg:#f4f5f7; --panel:#fff; --line:#e1e4e8; --text:#1d2025; --muted:#6a717c;
+  --accent:#d9480f; --accent-ink:#fff; --ok:#2b8a3e; --warn:#c77c02; --bad:#c92a2a;
+  --field:#f7f8fa; --shadow:0 1px 2px rgba(0,0,0,.05);
+}
+@media (prefers-color-scheme: dark){
+  :root{
+    --bg:#15171a; --panel:#1d2024; --line:#2c3036; --text:#e6e8eb; --muted:#9097a1;
+    --accent:#ff7a3d; --accent-ink:#1a0d05; --ok:#51cf66; --warn:#fcc419; --bad:#ff6b6b;
+    --field:#24282d; --shadow:none;
+  }
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+header{display:flex;align-items:center;gap:12px;padding:14px 20px;border-bottom:1px solid var(--line);background:var(--panel);position:sticky;top:0;z-index:2}
+header h1{font-size:16px;margin:0;font-weight:650;letter-spacing:.01em}
+header .ver{color:var(--muted);font-size:12px}
+.pill{display:inline-flex;align-items:center;gap:7px;padding:4px 10px;border-radius:999px;font-size:12px;font-weight:600;background:var(--field);border:1px solid var(--line)}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--muted)}
+.pill.ok .dot{background:var(--ok)} .pill.warn .dot{background:var(--warn)} .pill.bad .dot{background:var(--bad)}
+.spacer{flex:1}
+main{display:grid;grid-template-columns:minmax(0,1fr) 360px;gap:16px;padding:16px 20px;max-width:1500px;margin:0 auto}
+@media (max-width:900px){main{grid-template-columns:1fr;padding:12px 16px}}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;box-shadow:var(--shadow)}
+.panel h2{font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin:0;padding:12px 14px 0;font-weight:650}
+.panel .body{padding:12px 14px 14px}
+.side{display:flex;flex-direction:column;gap:16px;min-width:0}
+.preview{position:relative;background:#0c0d0f;border-radius:10px;overflow:hidden;aspect-ratio:16/9;display:flex;align-items:center;justify-content:center}
+.preview img{width:100%;height:100%;object-fit:contain;display:block}
+.overlay{position:absolute;left:10px;bottom:10px;display:flex;gap:6px;flex-wrap:wrap}
+.tag{background:rgba(0,0,0,.6);color:#fff;font-size:12px;padding:3px 8px;border-radius:6px;font-variant-numeric:tabular-nums}
+.banner{margin-top:12px;padding:10px 12px;border-radius:8px;border:1px solid var(--line);background:var(--field);display:none}
+.banner.show{display:block}
+.banner.warn{border-color:color-mix(in srgb,var(--warn) 50%,var(--line))}
+.banner.bad{border-color:color-mix(in srgb,var(--bad) 50%,var(--line))}
+.banner b{display:block;margin-bottom:2px}
+.banner ul{margin:6px 0 0;padding-left:18px;color:var(--muted)}
+label{display:block;font-size:12px;color:var(--muted);margin:10px 0 4px}
+label:first-child{margin-top:0}
+input[type=file]{width:100%;font:inherit;color:var(--muted)}
+select,input[type=text],input[type=password]{width:100%;padding:8px 10px;border:1px solid var(--line);border-radius:7px;background:var(--field);color:var(--text);font:inherit}
+.row{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+button{font:inherit;padding:8px 12px;border-radius:7px;border:1px solid var(--line);background:var(--field);color:var(--text);cursor:pointer}
+button:hover{border-color:var(--muted)}
+button.primary{background:var(--accent);border-color:var(--accent);color:var(--accent-ink);font-weight:600}
+button:disabled{opacity:.5;cursor:default}
+.actions{display:flex;gap:8px;margin-top:12px;flex-wrap:wrap}
+.hint{font-size:12px;color:var(--muted);margin-top:8px}
+.ctrl{padding:8px 0;border-top:1px solid var(--line)}
+.ctrl:first-child{border-top:0;padding-top:0}
+.ctrl .top{display:flex;justify-content:space-between;gap:8px;font-size:13px}
+.ctrl .val{color:var(--muted);font-variant-numeric:tabular-nums}
+.ctrl.inactive{opacity:.45}
+.ctrl input[type=range]{width:100%;accent-color:var(--accent);margin:6px 0 0}
+.ctrl select{margin-top:6px}
+.switch{display:flex;align-items:center;gap:8px;cursor:pointer}
+.kv{display:grid;grid-template-columns:auto 1fr;gap:4px 12px;font-size:13px}
+.kv dt{color:var(--muted)} .kv dd{margin:0;overflow-wrap:anywhere;font-variant-numeric:tabular-nums}
+.url{display:flex;gap:6px;margin-top:6px}
+.url input{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}
+.empty{color:var(--muted);font-size:13px}
+#toast{position:fixed;right:16px;bottom:16px;background:var(--text);color:var(--bg);padding:9px 14px;border-radius:8px;font-size:13px;opacity:0;transform:translateY(8px);transition:.2s;pointer-events:none;max-width:calc(100vw - 32px)}
+#toast.show{opacity:1;transform:none}
+#toast.err{background:var(--bad);color:#fff}
+</style>
+</head>
+<body>
+<header>
+  <h1>Bridge Camera</h1><span class="ver" id="ver"></span>
+  <span class="spacer"></span>
+  <span class="pill" id="pill"><span class="dot"></span><span id="pilltext">Connecting…</span></span>
+</header>
+
+<main>
+  <section>
+    <div class="preview"><img id="preview" alt="Camera preview"><div class="overlay" id="tags"></div></div>
+    <div class="banner" id="banner"></div>
+
+    <div class="panel" style="margin-top:16px">
+      <h2>Connect LightBurn</h2>
+      <div class="body">
+        <div class="hint" style="margin-top:0">In LightBurn's camera settings choose a network camera and paste one of these:</div>
+        <label>MJPEG stream (recommended)</label>
+        <div class="url"><input type="text" id="urlStream" readonly><button data-copy="urlStream">Copy</button></div>
+        <label>Snapshot</label>
+        <div class="url"><input type="text" id="urlSnap" readonly><button data-copy="urlSnap">Copy</button></div>
+        <div class="hint">Reserve this IP in your router so the address doesn't change. Re-run LightBurn's lens calibration and camera alignment after changing camera or resolution.</div>
+      </div>
+    </div>
+  </section>
+
+  <aside class="side">
+    <div class="panel">
+      <h2>Camera</h2>
+      <div class="body">
+        <label for="dev">Device</label>
+        <select id="dev"></select>
+        <div class="row">
+          <div><label for="res">Resolution</label><select id="res"></select></div>
+          <div><label for="fps">Frame rate</label><select id="fps"></select></div>
+        </div>
+        <div class="actions">
+          <button class="primary" id="apply">Apply</button>
+          <button id="restart">Restart camera</button>
+        </div>
+        <div class="hint" id="cfgHint"></div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>Image controls</h2>
+      <div class="body">
+        <div id="ctrls"><div class="empty">Controls appear when a camera is streaming.</div></div>
+        <div class="actions"><button id="resetCtrls" disabled>Reset to defaults</button></div>
+        <div class="hint">Changes apply live and are saved for this camera. Tip: turn off auto focus and auto exposure for repeatable alignment.</div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>Status</h2>
+      <div class="body"><dl class="kv" id="kv"></dl></div>
+    </div>
+
+    <div class="panel">
+      <h2>Software</h2>
+      <div class="body" id="sw">
+        <dl class="kv" id="swkv"></dl>
+        <div class="banner" id="swlast" style="margin-top:10px"></div>
+
+        <div id="swUpdate" hidden>
+          <label for="upFile">Update file (lbcam-update-….tar.gz)</label>
+          <input type="file" id="upFile" accept=".gz,.tgz,application/gzip">
+          <div id="upPwWrap" hidden><label for="upPw">Update password</label><input type="password" id="upPw" autocomplete="current-password"></div>
+          <div class="actions">
+            <button class="primary" id="upGo">Install update</button>
+            <button id="rbGo">Roll back</button>
+          </div>
+          <div class="hint">The new version is tested on the Bridge first, and if it doesn't start properly the previous version comes back automatically. Settings are kept.</div>
+          <div class="hint"><a href="#" id="pwChange"></a></div>
+          <div id="swChangePw" hidden>
+            <div id="pwCurWrap"><label for="pwCur">Current password</label><input type="password" id="pwCur" autocomplete="current-password"></div>
+            <label for="pwNewC">New password</label><input type="password" id="pwNewC" autocomplete="new-password">
+            <div class="actions">
+              <button class="primary" id="pwChangeSave">Save password</button>
+              <button id="pwRemove">Remove password</button>
+            </div>
+          </div>
+        </div>
+        <div class="hint" id="swNotManaged" hidden>This install can't update itself. Flash the latest image once to enable updates.</div>
+      </div>
+    </div>
+  </aside>
+</main>
+<div id="toast"></div>
+
+<script>
+const $ = s => document.querySelector(s);
+let state = null, modes = [], modesFor = null, dirty = false, dragging = false, lastCtrlSig = "";
+
+function toast(msg, err){
+  const t = $("#toast"); t.textContent = msg; t.className = "show" + (err ? " err" : "");
+  clearTimeout(toast.t); toast.t = setTimeout(() => t.className = "", 2600);
+}
+async function api(path, body){
+  const opt = body === undefined ? {} : {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body)};
+  const r = await fetch(path, opt);
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j.error || ("HTTP " + r.status));
+  return j;
+}
+function esc(s){ return String(s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
+function fmtUptime(s){ const h=Math.floor(s/3600), m=Math.floor(s%3600/60); return h ? `${h}h ${m}m` : `${m}m ${s%60}s`; }
+
+/* ---------- preview: one long-lived stream, reconnect if it drops ---------- */
+function startPreview(){
+  const img = $("#preview");
+  img.onerror = () => setTimeout(startPreview, 2000);
+  img.src = "/stream?t=" + Date.now();
+}
+
+/* ---------- state polling ---------- */
+async function poll(){
+  try {
+    state = await api("/api/state");
+    render();
+  } catch(e) {
+    setPill("bad", "Bridge unreachable");
+  }
+  setTimeout(poll, 2000);
+}
+function setPill(kind, text){ $("#pill").className = "pill " + kind; $("#pilltext").textContent = text; }
+
+function render(){
+  const s = state, cam = s.camera || {};
+  $("#ver").textContent = "v" + s.version;
+  const map = {streaming:["ok","Live"], searching:["warn","No camera"], error:["bad","Camera error"], starting:["warn","Starting…"]};
+  const [k, t] = map[s.state] || ["warn", s.state];
+  setPill(k, t);
+
+  // tags over preview
+  const tags = [];
+  if (s.state === "streaming") {
+    tags.push(`${cam.width}×${cam.height}`, `${s.fps || 0} fps`);
+    if (cam.name) tags.push(cam.name);
+  }
+  tags.push(`${s.clients} viewer${s.clients === 1 ? "" : "s"}`);
+  $("#tags").innerHTML = tags.map(x => `<span class="tag">${esc(x)}</span>`).join("");
+
+  renderBanner(s);
+  renderUrls(s);
+  renderStatus(s);
+  if (!dirty) renderCameraForm(s);
+  renderControls();
+}
+
+function renderBanner(s){
+  const b = $("#banner"); const cam = s.camera || {};
+  let html = "", kind = "";
+  if (s.state === "searching") {
+    kind = "warn";
+    html = `<b>${esc(s.message || "No camera connected")}</b>LightBurn is being sent a "Camera not connected" image until one is plugged in.
+      <ul><li>Plug a UVC (MJPEG) USB camera into the Bridge.</li><li>Try another cable or port; avoid unpowered hubs.</li><li>It is picked up automatically within a few seconds.</li></ul>`;
+  } else if (s.state === "error") {
+    kind = "bad";
+    html = `<b>${esc(s.message)}</b>Retrying automatically.<ul><li>Pick a lower resolution or frame rate and Apply.</li><li>Unplug the camera and plug it back in.</li><li>Use <i>Restart camera</i>.</li></ul>`;
+  } else if (s.state === "streaming" && s.message) {
+    kind = "warn"; html = `<b>${esc(s.message)}</b>`;
+  } else if (s.state === "streaming" && cam.requested && (cam.requested.width !== cam.width || cam.requested.height !== cam.height)) {
+    kind = "warn"; html = `<b>Camera chose ${cam.width}×${cam.height}</b>It doesn't support ${cam.requested.width}×${cam.requested.height}.`;
+  }
+  if (s.config.save_error) { kind = "bad"; html += `<b>Settings not saved</b>${esc(s.config.save_error)}`; }
+  if (s.config.load_error) { kind = kind || "warn"; html += `<b>Settings file problem</b>${esc(s.config.load_error)}`; }
+  b.className = "banner" + (html ? " show " + kind : ""); b.innerHTML = html;
+}
+
+function renderUrls(s){
+  const host = location.hostname || (s.ips[0] || "bridge");
+  const port = location.port ? ":" + location.port : "";
+  $("#urlStream").value = `http://${host}${port}/stream`;
+  $("#urlSnap").value = `http://${host}${port}/snapshot.jpg`;
+}
+
+function renderStatus(s){
+  const cam = s.camera || {};
+  const rows = [
+    ["State", s.state + (s.message ? " — " + s.message : "")],
+    ["Camera", cam.name || "—"],
+    ["Device", cam.device ? `${cam.device}` : "—"],
+    ["Mode", cam.width ? `${cam.width}×${cam.height} @ ${cam.fps ?? "?"} fps (MJPEG)` : "—"],
+    ["Measured", s.state === "streaming" ? `${s.fps} fps` : "—"],
+    ["Viewers", s.clients],
+    ["Bridge IP", s.ips.join(", ") || "—"],
+    ["Uptime", fmtUptime(s.uptime)],
+    ["Settings", s.config.path],
+  ];
+  $("#kv").innerHTML = rows.map(([a,b]) => `<dt>${esc(a)}</dt><dd>${esc(b)}</dd>`).join("");
+}
+
+/* ---------- camera / mode form ---------- */
+async function loadModes(dev){
+  modesFor = dev;
+  try { modes = await api("/api/modes?device=" + encodeURIComponent(dev)); } catch(e) { modes = []; }
+}
+function renderCameraForm(s){
+  const devSel = $("#dev");
+  const cams = s.cameras;
+  const opts = [`<option value="auto">Automatic (first camera found)</option>`]
+    .concat(cams.map(c => `<option value="${esc(c.id)}">${esc(c.name)}${c.mjpeg === false ? " — no MJPEG" : ""}${c.error ? " — " + esc(c.error) : ""}</option>`));
+  // keep a saved camera visible even if it's unplugged
+  if (s.config.device !== "auto" && !cams.some(c => c.id === s.config.device))
+    opts.push(`<option value="${esc(s.config.device)}">${esc(s.config.device.split("/").pop())} — not plugged in</option>`);
+  const html = opts.join("");
+  if (devSel.dataset.html !== html) { devSel.innerHTML = html; devSel.dataset.html = html; }
+  devSel.value = s.config.device;
+
+  const want = s.config.device === "auto" ? (s.camera.id || "auto") : s.config.device;
+  if (modesFor !== want || (!modes.length && s.state === "streaming")) {
+    loadModes(want).then(() => fillModes(s.config.width, s.config.height, s.config.fps));
+  } else fillModes(s.config.width, s.config.height, s.config.fps);
+  $("#cfgHint").textContent = cams.length ? `${cams.length} camera${cams.length>1?"s":""} detected.` : "No cameras detected.";
+}
+function fillModes(w, h, fps){
+  const res = $("#res"), fs = $("#fps");
+  let list = modes.length ? modes : [{width:w, height:h, fps:[fps]}];
+  if (!list.some(m => m.width === w && m.height === h)) list = [{width:w, height:h, fps:[fps]}].concat(list);
+  const rhtml = list.map(m => `<option value="${m.width}x${m.height}">${m.width} × ${m.height}</option>`).join("");
+  if (res.dataset.html !== rhtml) { res.innerHTML = rhtml; res.dataset.html = rhtml; }
+  res.value = `${w}x${h}`;
+  fillFps(fps);
+}
+function fillFps(prefer){
+  const [w, h] = $("#res").value.split("x").map(Number);
+  const m = modes.find(m => m.width === w && m.height === h);
+  let rates = (m && m.fps.length) ? m.fps.slice() : [5, 10, 15, 20, 30];
+  if (prefer && !rates.includes(prefer)) rates.push(prefer);
+  rates.sort((a,b) => b - a);
+  const fs = $("#fps");
+  fs.innerHTML = rates.map(r => `<option value="${r}">${r} fps</option>`).join("");
+  fs.value = String(prefer && rates.includes(prefer) ? prefer : (rates.includes(15) ? 15 : rates[rates.length-1]));
+}
+$("#dev").addEventListener("change", async e => {
+  dirty = true;
+  const dev = e.target.value === "auto" ? ((state.cameras[0] || {}).id || "auto") : e.target.value;
+  await loadModes(dev);
+  const cur = state.config;
+  const keep = modes.find(m => m.width === cur.width && m.height === cur.height) || modes.find(m => m.width === 1280 && m.height === 720) || modes[0];
+  fillModes(keep ? keep.width : cur.width, keep ? keep.height : cur.height, cur.fps);
+});
+$("#res").addEventListener("change", () => { dirty = true; fillFps(Number($("#fps").value)); });
+$("#fps").addEventListener("change", () => { dirty = true; });
+$("#apply").addEventListener("click", async () => {
+  const [width, height] = $("#res").value.split("x").map(Number);
+  const btn = $("#apply"); btn.disabled = true;
+  try {
+    await api("/api/config", {device: $("#dev").value, width, height, fps: Number($("#fps").value)});
+    toast("Applied — camera restarting"); dirty = false; lastCtrlSig = "";
+  } catch(e) { toast(e.message, true); }
+  btn.disabled = false;
+});
+$("#restart").addEventListener("click", async () => {
+  try { await api("/api/restart", {}); toast("Restarting camera"); lastCtrlSig = ""; } catch(e) { toast(e.message, true); }
+});
+
+/* ---------- image controls ---------- */
+async function renderControls(force){
+  if (dragging) return;
+  const box = $("#ctrls"), reset = $("#resetCtrls");
+  if (state.state !== "streaming") {
+    if (lastCtrlSig !== "none") { box.innerHTML = `<div class="empty">Controls appear when a camera is streaming.</div>`; lastCtrlSig = "none"; }
+    reset.disabled = true; return;
+  }
+  const sig = (state.camera.id || "") + "|" + state.camera.width + "x" + state.camera.height;
+  if (sig === lastCtrlSig && !force) return;
+  let ctrls;
+  try { ctrls = await api("/api/controls"); } catch(e) { return; }
+  lastCtrlSig = sig;
+  drawControls(ctrls);
+}
+function drawControls(ctrls){
+  const box = $("#ctrls"); $("#resetCtrls").disabled = !ctrls.length;
+  if (!ctrls.length) { box.innerHTML = `<div class="empty">This camera exposes no adjustable controls.</div>`; return; }
+  box.innerHTML = "";
+  for (const c of ctrls) {
+    const el = document.createElement("div");
+    el.className = "ctrl" + (c.inactive ? " inactive" : "");
+    const dis = c.readonly ? "disabled" : "";
+    if (c.type === "bool") {
+      el.innerHTML = `<label class="switch" style="margin:0;color:var(--text)"><input type="checkbox" ${c.value ? "checked" : ""} ${dis}> ${esc(c.name)}</label>`;
+      el.querySelector("input").addEventListener("change", e => setCtrl(c.id, e.target.checked ? 1 : 0, true));
+    } else if (c.type === "menu") {
+      el.innerHTML = `<div class="top"><span>${esc(c.name)}</span></div><select ${dis}>${c.menu.map(m => `<option value="${m.value}">${esc(m.label)}</option>`).join("")}</select>`;
+      const s = el.querySelector("select"); s.value = String(c.value);
+      s.addEventListener("change", e => setCtrl(c.id, Number(e.target.value), true));
+    } else {
+      el.innerHTML = `<div class="top"><span>${esc(c.name)}</span><span class="val">${c.value}</span></div>
+        <input type="range" min="${c.min}" max="${c.max}" step="${c.step}" value="${c.value}" ${dis} title="default ${c.default}">`;
+      const r = el.querySelector("input"), v = el.querySelector(".val");
+      let t = null;
+      r.addEventListener("pointerdown", () => dragging = true);
+      r.addEventListener("input", () => { v.textContent = r.value; clearTimeout(t); t = setTimeout(() => setCtrl(c.id, Number(r.value), false), 120); });
+      r.addEventListener("change", () => { dragging = false; clearTimeout(t); setCtrl(c.id, Number(r.value), true); });
+      r.addEventListener("dblclick", () => { r.value = c.default; v.textContent = c.default; setCtrl(c.id, c.default, true); });
+    }
+    box.appendChild(el);
+  }
+}
+async function setCtrl(id, value, redraw){
+  try {
+    const j = await api("/api/control", {id, value});
+    if (redraw) drawControls(j.controls);  // auto modes can enable/disable other controls
+  } catch(e) { toast(e.message, true); if (redraw) renderControls(true); }
+}
+$("#resetCtrls").addEventListener("click", async () => {
+  try { const j = await api("/api/controls/reset", {}); drawControls(j.controls); toast("Controls reset"); } catch(e) { toast(e.message, true); }
+});
+
+document.querySelectorAll("[data-copy]").forEach(b => b.addEventListener("click", async () => {
+  const i = document.getElementById(b.dataset.copy);
+  try { await navigator.clipboard.writeText(i.value); } catch(e) { i.select(); document.execCommand("copy"); }
+  toast("Copied");
+}));
+
+/* ---------- software updates ---------- */
+let busy = false;
+async function loadSw(){
+  let u; try { u = await api("/api/update"); } catch(e) { return; }
+  const when = t => t ? new Date(t * 1000).toLocaleString() : "";
+  $("#swkv").innerHTML = [["Version", u.version], ["Previous", u.previous || "—"]]
+    .map(([a,b]) => `<dt>${esc(a)}</dt><dd>${esc(b)}</dd>`).join("");
+  const last = $("#swlast"), lu = u.last_update;
+  if (lu && lu.result === "rolled_back") {
+    last.className = "banner show bad";
+    last.innerHTML = `<b>Update to ${esc(lu.version)} failed — rolled back${lu.restored ? " to " + esc(lu.restored) : ""}</b>${esc(lu.reason || "")}<br><span class="hint">${esc(when(lu.time))}</span>`;
+  } else if (lu && lu.result === "installed") {
+    last.className = "banner show";
+    last.innerHTML = `<b>Updated to ${esc(lu.version)}</b><span class="hint">${esc(when(lu.time))}</span>`;
+  } else { last.className = "banner"; }
+  pwSet = u.password_set;
+  $("#swNotManaged").hidden = u.managed;
+  $("#swUpdate").hidden = !u.managed;
+  $("#upPwWrap").hidden = !pwSet;
+  $("#pwCurWrap").hidden = !pwSet;
+  $("#pwRemove").hidden = !pwSet;
+  $("#pwChange").textContent = pwSet ? "Change or remove update password" : "Protect updates with a password (optional)";
+  $("#rbGo").disabled = !u.previous;
+  $("#rbGo").title = u.previous ? "Go back to " + u.previous : "No previous version";
+}
+async function waitForRestart(fromVersion, label){
+  busy = true; setPill("warn", label);
+  const t0 = Date.now(); let seenDown = false;
+  while (Date.now() - t0 < 90000) {
+    await new Promise(r => setTimeout(r, 1500));
+    try {
+      const s = await api("/status");
+      if (s.version !== fromVersion || seenDown) { location.reload(); return; }
+    } catch(e) { seenDown = true; }
+  }
+  busy = false; toast("Bridge didn't come back within 90 s — refresh the page", true);
+}
+let pwSet = false;
+$("#pwChange").addEventListener("click", e => { e.preventDefault(); $("#swChangePw").hidden = !$("#swChangePw").hidden; });
+$("#pwChangeSave").addEventListener("click", async () => {
+  if (!$("#pwNewC").value) return toast("Enter a new password", true);
+  try { await api("/api/update/password", {current: $("#pwCur").value, new: $("#pwNewC").value});
+        toast(pwSet ? "Password changed" : "Update password set"); $("#pwCur").value = $("#pwNewC").value = "";
+        $("#swChangePw").hidden = true; loadSw(); }
+  catch(e) { toast(e.message, true); }
+});
+$("#pwRemove").addEventListener("click", async () => {
+  try { await api("/api/update/password", {current: $("#pwCur").value, new: ""});
+        toast("Password removed"); $("#pwCur").value = ""; $("#swChangePw").hidden = true; loadSw(); }
+  catch(e) { toast(e.message, true); }
+});
+$("#upGo").addEventListener("click", async () => {
+  const f = $("#upFile").files[0];
+  if (!f) return toast("Choose an update file first", true);
+  if (pwSet && !$("#upPw").value) return toast("Enter the update password", true);
+  const btn = $("#upGo"); btn.disabled = true; btn.textContent = "Uploading…";
+  try {
+    const r = await fetch("/api/update", {method: "POST", body: f,
+      headers: {"Content-Type": "application/octet-stream", "X-Password": $("#upPw").value}});
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(j.error || ("HTTP " + r.status));
+    toast("Installed " + j.version + " — restarting");
+    await waitForRestart(state ? state.version : "", "Updating to " + j.version + "…");
+  } catch(e) { toast(e.message, true); }
+  btn.disabled = false; btn.textContent = "Install update";
+});
+$("#rbGo").addEventListener("click", async () => {
+  if (pwSet && !$("#upPw").value) return toast("Enter the update password", true);
+  if (!confirm("Roll back to the previous version?")) return;
+  try {
+    const j = await api("/api/update/rollback", {password: $("#upPw").value});
+    toast("Rolling back to " + j.version);
+    await waitForRestart(state ? state.version : "", "Rolling back…");
+  } catch(e) { toast(e.message, true); }
+});
+
+startPreview();
+poll();
+loadSw();
+setInterval(() => { if (!busy) loadSw(); }, 15000);
+</script>
+</body>
+</html>

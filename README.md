@@ -165,3 +165,7 @@ Laggy or choppy: lower resolution or frame rate. Weak WiFi is the usual cause.
 - **The stock Bridge image has SSH enabled with the default Raspberry Pi login and
   passwordless sudo.** Change it with `ssh pi@<bridge-ip> passwd`. That comes from the
   stock image, not from this project.
+
+## License
+
+MIT. See [LICENSE](LICENSE).

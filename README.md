@@ -21,10 +21,16 @@ USB camera ─▶ LightBurn Bridge (lbcam, port 8080) ─WiFi─▶ LightBurn "n
   - head position, machine counters (power-on, work and laser-on hours, job count), model
   - laser connection: Ethernet link, whether the controller answers, LightBurn relay status
   - Bridge health: CPU temperature, under-voltage/throttling, load
-  - laser buttons: **Pause / Resume / Stop** during a job
+  - laser buttons: **Pause / Resume / Stop** during a job (Resume asks for confirmation, and for
+    the update password when one is set, because it makes the laser fire again)
+  - **Go to origin** and **Frame** / **Outline frame** while the laser is idle: the same laser-off
+    moves LightBurn sends, built on the Bridge. Stop also cancels a frame or move.
   - **"Laser isn't firing" warning** when a job has run 20 s without the laser-on counter
     moving: usually an alarm on the panel such as Water Prot (the water alarm itself can't be
     read from the controller)
+  - **job file view**: a drawing of the job LightBurn sent, by layer colour, with the done part
+    and the laser head marked while it runs, plus the last 10 jobs and how each run ended
+    (see [Job capture](#job-capture))
   - reloads itself after a software update
 - **Alerts on the page** (setup and monitor): job started / paused / resumed / finished /
   stopped at N%, laser disconnected / connected, camera unplugged / plugged in, Bridge hot or
@@ -176,9 +182,16 @@ sudo journalctl -u lbcam -f
 | `POST /api/network/revert` | undo a pending change now |
 | `GET /api/logs?n=200` | recent log lines |
 | `GET /api/laser` | laser connection check plus controller status under `controller` (`?fresh=1` skips the 5 s cache) |
+| `GET /api/jobs` | captured jobs (newest first, with their runs), the job being received (`live`), the job running now (`running`) and the capture state |
+| `GET /api/jobs/<id>.rd` | a captured job as plain (unswizzled) Ruida bytes; `live.rd` is the one still being received |
+| `POST /api/jobs/clear` | delete all captured jobs |
+| `POST /api/laser/record` | `{"seconds": 30}` (5–120): record LightBurn ↔ laser traffic, decoded (diagnostics) |
+| `GET /api/laser/record` | the recording: packets with time, direction and commands; status polls and ACKs only counted |
 | `GET /api/health` | Bridge CPU temperature, power/throttling flags, load, uptime |
-| `GET /api/laser/scan?start=0x200&count=256` | diagnostic: read a range of controller memory (idle only, read-only) |
-| `POST /api/laser/command` | `{"cmd": "pause" \| "resume" \| "stop"}` |
+| `POST /api/laser/scan` | `{"start": "0x200", "count": 256}`. Diagnostic: reads a range of controller memory (idle only, read-only, at most 512 addresses; stops early if the laser gets busy) |
+| `POST /api/laser/origin` | move the head to the origin stored in the controller (laser off; idle only) |
+| `POST /api/laser/frame` | `{"job": "<id>", "kind": "box" \| "outline"}`: trace a captured job's bounding box or outline (laser off; idle only; absolute-placed jobs only), then return |
+| `POST /api/laser/command` | `{"cmd": "pause" \| "resume" \| "stop"}`. `resume` also needs `"password"` when the update password is set |
 
 Every `POST` needs the header `X-LBCam: 1`, and an `Origin` header (if sent) must match the
 Bridge's address. That stops other websites from changing settings through your browser.
@@ -276,12 +289,46 @@ doesn't change the status bits, so "Moving" comes from the head position changin
 without a job file don't count as jobs. Hour counters are in seconds, the controller's previous job time in milliseconds. Other
 models may differ; `/api/laser` includes the raw values under `controller.raw` for checking.
 
+Head moves were recorded from LightBurn on an RDC6442G with **Record laser traffic**. Go to
+origin is `C9 02` (speed 100 mm/s), `C6 01`/`C6 21` (power 0), then `D9 10 00 <x> <y>`, a
+laser-off rapid move to absolute µm. The origin it goes to is stored in the controller at
+`0x0224`/`0x0234` (X/Y) and again at `0x0229`/`0x0239`; the Bridge refuses to move if the two
+copies disagree. A frame is the same moves around the outline, at 100 mm/s with all four power
+settings at 0. `D8 01` (Stop) cancels a frame that is still being sent. MeerK40t's "Home XY"
+(`D8 2A`) is deliberately not used: it reset this controller.
+
+### Job capture
+
+LightBurn's relay sends each job to the controller over the Bridge's Ethernet port. lbcam
+copies those packets with a read-only packet socket on `eth0`. It never sends anything, so
+neither the relay nor the laser notices. Resent packets are kept once, LightBurn's status
+polls are left out, and a job ends at the Ruida end-of-file command (or after 10 s without
+data). Streams without a single cut (framing, jogging) aren't kept.
+
+- Jobs are stored in `/opt/lbcam/jobs` (the last 10; change the folder with `LBCAM_JOBS_DIR`)
+  as plain Ruida bytes. The dashboard decodes and draws them; the Bridge doesn't.
+- A run is matched to the job captured up to 10 minutes before it started. Jobs started from
+  files stored on the laser's panel can't be shown unless they were sent while lbcam was running.
+- The drawing's done part comes from the controller's progress, so it's approximate. Use
+  **Mirror** / **Flip** once to match your machine's origin (remembered per browser).
+- Turn it off with `LBCAM_JOBS=0` in `/boot/lbcam.env`.
+- **Frame** and **Outline frame** trace the shown job's bounding box or the outline around its
+  cuts (its convex hull, like LightBurn's rubber-band frame) at 100 mm/s with laser power set
+  to 0, then return the head to where it was. Only for jobs placed with LightBurn's
+  *Start From: Absolute Coords* (the job header must match its cuts), and only while idle.
+- If a job draws wrong, **Download raw** saves exactly what was captured, for a bug report.
+- **Record laser traffic** (setup page) records everything LightBurn and the controller send
+  each other for 30 s, decoded into commands. Use it to see what a LightBurn button sends.
+
 Laggy or choppy: lower resolution or frame rate. Weak WiFi is the usual cause.
 
 ## Security
 
 - Intended for a trusted local network. The stream and camera settings are open to anyone
-  on the network. Software updates can be protected with the optional update password.
+  on the network. Software updates and resuming a paused job can be protected with the optional
+  update password (Pause and Stop never need it).
+- Captured jobs (your designs) can be viewed and downloaded by anyone on the network, like
+  the camera. Clear them from the monitor page, or turn capture off with `LBCAM_JOBS=0`.
 - The API refuses cross-site requests and unknown host names (CSRF and DNS-rebinding
   protection), so a web page you visit can't change the Bridge's settings.
 - **The stock Bridge image has SSH enabled with the default Raspberry Pi login and

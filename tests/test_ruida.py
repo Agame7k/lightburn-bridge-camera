@@ -4,6 +4,7 @@ import struct
 import threading
 import time
 import unittest
+from unittest import mock
 
 from helpers import load
 
@@ -19,6 +20,7 @@ class FakeRuida:
         self.requests = []
         self.commands = []
         self.silent_commands = False
+        self.ack_delay = 0.0  # s before answering a command (a slow controller)
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.bind(("127.0.0.1", 0))
         self.port = self.sock.getsockname()[1]
@@ -48,8 +50,11 @@ class FakeRuida:
         self.requests.append(d)
         if self.silent_commands and d[:1] in (b"\xD8", b"\xA5"):
             return
+        cmd = d[:1] in (b"\xD8", b"\xA5", b"\xD9", b"\xC9", b"\xC6")
+        if self.ack_delay and cmd:
+            time.sleep(self.ack_delay)
         self.sock.sendto(app.ruida_swizzle(b"\xCC", self.magic), src)  # ACK first, like the real one
-        self.commands.append(d) if d[:1] in (b"\xD8", b"\xA5") else None
+        self.commands.append(d) if cmd else None
         if d == b"\xD8\x02":
             self.mem[0x0200] = 0x10403
         elif d == b"\xD8\x03":
@@ -314,7 +319,157 @@ class CommandTest(unittest.TestCase):
         self.assertEqual([d for d in self.ctrl.requests if d[:1] == b"\xD8"], [b"\xD8\x02"])
 
 
+    def test_slow_ack_after_timeout_is_still_reported_as_done(self):
+        # The command is already on the wire when command()'s own timeout runs out: it must
+        # wait for the answer instead of telling the user it wasn't sent.
+        self.ctrl.mem[0x0200] = 0x10401
+        self.wait_for(lambda s: s["state"] == "running")
+        # pickup can take one read (<= 0.6 s); the answer comes well after command()'s 1 s timeout
+        self.ctrl.ack_delay = 2.0
+        with mock.patch.object(app, "SEND_WAIT", 3.0), mock.patch.object(app, "SEND_BUDGET", 6.0):
+            self.assertTrue(self.r.command("stop", timeout=1.0))
+        self.assertEqual(self.ctrl.commands, [b"\xD8\x01"])
+
+    def test_sent_but_unanswered_is_not_called_unsent(self):
+        self.ctrl.mem[0x0200] = 0x10401
+        self.wait_for(lambda s: s["state"] == "running")
+        self.ctrl.silent_commands = True
+        with self.assertRaises(app.RuidaCommandError) as cm:
+            self.r.command("pause", timeout=1.0)
+        self.assertNotIn("not sent", str(cm.exception))
+
+
+class UnsentCommandTest(unittest.TestCase):
+    def test_worker_never_picks_it_up(self):
+        r = app.Ruida(FakeLaser(), enabled=True)  # no worker thread running
+        r.state, r.values, r.magic = {"available": True}, {"state": "running"}, 0x88
+        with self.assertRaises(app.RuidaCommandError) as cm:
+            r.command("stop", timeout=0.2)
+        self.assertIn("not sent", str(cm.exception))
+        self.assertIsNone(r.cmd)  # withdrawn: a late worker won't send it
+
+
+ORIGIN = {0x0224: 276113, 0x0234: 435380, 0x0229: 276113, 0x0239: 435380}
+
+
+class MotionTest(CommandTest):
+    """Go to origin and Frame, as LightBurn sends them (recorded on an RDC6442G)."""
+
+    def setUp(self):
+        super().setUp()
+        self.ctrl.mem.update(ORIGIN)
+        self.ctrl.mem.update({0x0221: 148845, 0x0231: 186540})  # head jogged away from the origin
+
+    def test_go_to_origin_matches_lightburn(self):
+        r = self.r.go_to_origin(who="test")
+        self.assertEqual(self.ctrl.commands, [
+            bytes.fromhex("C9 02 00 00 06 0D 20"),           # 100 mm/s
+            bytes.fromhex("C6 01 00 00"), bytes.fromhex("C6 21 00 00"),
+            bytes.fromhex("D9 10 00 00 00 10 6D 11 00 00 1A 49 34")])  # exactly LightBurn's bytes
+        self.assertEqual((r["packets"], r["sent"]), (4, 4))
+
+    def test_origin_copies_must_agree(self):
+        self.ctrl.mem[0x0229] = 0
+        with self.assertRaises(app.RuidaCommandError) as cm:
+            self.r.go_to_origin()
+        self.assertIn("disagree", str(cm.exception))
+        self.assertEqual(self.ctrl.commands, [])
+
+    def test_origin_shown_in_status(self):
+        with self.r.lock:  # the origin is a slow (60 s) read: interpret it directly
+            self.r.raw.update(origin_x=276113, origin_y=435380, origin_x2=276113, origin_y2=435380)
+            self.r._interpret()
+        self.assertEqual(self.r.status()["origin"], {"x": 276.11, "y": 435.38})
+        with self.r.lock:
+            self.r.raw["origin_x2"] = 0
+            self.r._interpret()
+        self.assertNotIn("origin", self.r.status())  # copies disagree: not shown
+
+    def test_only_while_idle(self):
+        self.ctrl.mem[0x0200] = 0x10401
+        self.wait_for(lambda s: s["state"] == "running")
+        for call in (self.r.go_to_origin, lambda: self.r.frame([(0, 0), (1000, 0), (1000, 1000)])):
+            with self.assertRaises(app.RuidaCommandError) as cm:
+                call()
+            self.assertIn("idle", str(cm.exception))
+        self.assertEqual(self.ctrl.commands, [])
+
+    def test_box_frame_matches_lightburn_and_returns(self):
+        box = [(306000, 40000), (306000, 332000), (626000, 332000), (626000, 40000), (306000, 40000)]
+        self.r.frame(box)
+        hx = lambda b: b.hex(" ").upper()
+        self.assertEqual([hx(c) for c in self.ctrl.commands], [
+            "C9 02 00 00 00 00 00", "C6 01 00 00", "C6 02 00 00", "C6 21 00 00", "C6 22 00 00",
+            "D9 10 00 00 00 12 56 50 00 00 02 38 40", "C9 02 00 00 06 0D 20",
+            "D9 10 00 00 00 12 56 50 00 00 14 21 60", "D9 10 00 00 00 26 1A 50 00 00 14 21 60",
+            "D9 10 00 00 00 26 1A 50 00 00 02 38 40", "D9 10 00 00 00 12 56 50 00 00 02 38 40",
+            "C9 02 00 00 00 00 00",
+            hx(app.ruida_rapid(148845, 186540))])  # back to where the head was
+
+    def test_stop_interrupts_a_frame(self):
+        self.ctrl.ack_delay = 0.05
+        outline = [(100000 + i * 100, 100000) for i in range(200)]
+        res = {}
+
+        def run():
+            try:
+                self.r.frame(outline)
+            except app.RuidaCommandError as e:
+                res["err"] = str(e)
+        t = threading.Thread(target=run)
+        t.start()
+        time.sleep(0.6)
+        self.assertTrue(self.r.command("stop"))  # allowed: the head is moving (status may still say idle)
+        t.join(20)
+        self.assertRegex(res.get("err", ""), "(interrupted|cancelled) by stop")  # depends on timing
+        self.assertIn(b"\xD8\x01", self.ctrl.commands)
+        self.assertLess(sum(1 for c in self.ctrl.commands if c[:1] == b"\xD9"), 100)
+
+    def test_stop_cancels_a_queued_frame(self):
+        # Stop before the worker started the frame: the frame must not run after the Stop.
+        r = app.Ruida(FakeLaser(), enabled=True)  # no worker thread: we play the worker
+        r.state, r.values, r.magic = {"available": True}, {"state": "idle"}, 0x88
+        job = {"name": "frame", "build": None, "who": "t", "done": threading.Event(), "error": None, "result": None}
+        r.motion = job  # queued, not started
+        threading.Thread(target=lambda: self.assertRaises(app.RuidaCommandError, r.command, "stop", "t", 0.3)).start()
+        time.sleep(0.1)
+        self.assertTrue(job.get("cancel"))
+        r._do_motion(None)  # what the worker does next: builds and sends nothing
+        self.assertEqual(job["error"], "cancelled by stop before it started")
+        self.assertEqual(job["result"]["sent"], 0)
+
+    def test_stop_still_refused_when_nothing_moves(self):
+        with self.assertRaises(app.RuidaCommandError):
+            self.r.command("stop")
+
+
 class ScanTest(CommandTest):
+    def test_command_is_sent_during_a_scan(self):
+        res = {}
+        t = threading.Thread(target=lambda: res.update(r=self.r.scan(0x1000, 512)))
+        t.start()
+        time.sleep(0.5)  # scan in progress (these addresses don't answer: 0.06 s each)
+        job = {"name": "stop", "payload": b"\xD8\x01", "who": "test", "done": threading.Event(),
+               "result": None, "sent": False}
+        with self.r.cmd_lock:
+            self.r.cmd = job
+        self.assertTrue(job["done"].wait(1.5), "command waited behind the scan")
+        self.assertEqual(job["result"], "ack")
+        t.join(40)
+
+    def test_scan_stops_when_laser_gets_busy(self):
+        res = {}
+        t = threading.Thread(target=lambda: res.update(r=self.r.scan(0x1000, 512)))
+        t.start()
+        time.sleep(0.3)
+        self.ctrl.mem[0x0200] = 0x10401  # a job started from LightBurn
+        t.join(15)
+        self.assertFalse(t.is_alive())
+        self.assertEqual(res["r"]["aborted"], "the laser became busy")
+        self.assertLess(res["r"]["seconds"], 10)
+        self.wait_for(lambda s: s["state"] == "running")
+
+
     def test_scan_reads_range_only_answered(self):
         r = self.r.scan(0x0200, 4)
         self.assertEqual(r["values"], {"0x0200": 0x10600, "0x0203": 5})  # 0x201/0x202 don't answer

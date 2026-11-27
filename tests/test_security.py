@@ -103,3 +103,93 @@ class HttpGuardTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StubRuida:
+    """Records what the HTTP layer asks of the controller."""
+
+    def __init__(self):
+        self.calls = []
+
+    def command(self, name, who="?"):
+        self.calls.append(("command", name))
+
+    def scan(self, start, count, who="?"):
+        self.calls.append(("scan", start, count))
+        return {"start": "0x%04X" % start, "count": count, "values": {}}
+
+    def want(self):
+        pass
+
+    def status(self):
+        return {"available": False}
+
+
+class HttpLaserTest(unittest.TestCase):
+    """Laser control and the memory scan go through the same CSRF guard as other changes."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        cfg = app.Config(os.path.join(self.tmp, "cfg.json"))
+        cam = app.Camera(cfg, b"\xff\xd8placeholder")
+        self.upd = app.Updater(cfg, home=self.tmp)
+        self.ruida = StubRuida()
+        self.srv = ThreadingHTTPServer(("127.0.0.1", 0),
+                                       app.make_handler(cam, cfg, b"<html>", self.upd, None, ruida=self.ruida))
+        self.port = self.srv.server_address[1]
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+
+    def tearDown(self):
+        self.srv.shutdown()
+        self.srv.server_close()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    req = HttpGuardTest.req
+
+    def post(self, path, body, headers=None):
+        h = {"X-LBCam": "1", "Content-Type": "application/json"}
+        h.update(headers or {})
+        r, data = self.req("POST", path, h, json.dumps(body).encode())
+        return r.status, json.loads(data.decode() or "{}")
+
+    def test_scan_is_not_a_get(self):
+        # a cross-site <img src=".../api/laser/scan"> must not tie up the controller
+        r, _ = self.req("GET", "/api/laser/scan?start=0x200&count=512")
+        self.assertNotEqual(r.status, 200)
+        self.assertEqual(self.ruida.calls, [])
+
+    def test_scan_post_needs_header(self):
+        r, _ = self.req("POST", "/api/laser/scan", {"Content-Type": "text/plain"}, b"{}")
+        self.assertEqual(r.status, 403)
+        self.assertEqual(self.ruida.calls, [])
+
+    def test_scan_post(self):
+        status, j = self.post("/api/laser/scan", {"start": "0x210", "count": 16})
+        self.assertEqual(status, 200, j)
+        self.assertEqual(self.ruida.calls, [("scan", 0x210, 16)])
+        status, j = self.post("/api/laser/scan", {"start": "nope"})
+        self.assertEqual(status, 400)
+
+    def test_resume_without_password_set(self):
+        status, j = self.post("/api/laser/command", {"cmd": "resume"})
+        self.assertEqual(status, 200, j)
+        self.assertEqual(self.ruida.calls, [("command", "resume")])
+
+    def test_resume_needs_password_when_set(self):
+        self.upd.set_password("s3cret")
+        status, j = self.post("/api/laser/command", {"cmd": "resume"})
+        self.assertEqual(status, 403)
+        self.assertIn("password", j["error"])
+        status, j = self.post("/api/laser/command", {"cmd": "resume", "password": "wrong"})
+        self.assertEqual(status, 403)
+        self.assertEqual(self.ruida.calls, [])
+        status, j = self.post("/api/laser/command", {"cmd": "resume", "password": "s3cret"})
+        self.assertEqual(status, 200, j)
+        self.assertEqual(self.ruida.calls, [("command", "resume")])
+
+    def test_pause_and_stop_never_need_password(self):
+        self.upd.set_password("s3cret")
+        for cmd in ("pause", "stop"):
+            status, j = self.post("/api/laser/command", {"cmd": cmd})
+            self.assertEqual(status, 200, j)
+        self.assertEqual(self.ruida.calls, [("command", "pause"), ("command", "stop")])

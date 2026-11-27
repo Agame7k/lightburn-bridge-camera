@@ -11,8 +11,9 @@ Endpoints
   /stream            MJPEG stream  -> LightBurn "network camera" (MJPEG)
   /snapshot[.jpg]    single JPEG   -> LightBurn "network camera" (snapshot)
   /status            short JSON status
-  /api/...           JSON API used by the dashboard
-                     (POST /api/laser/command {"cmd": pause|resume|stop} commands the laser)
+  /api/...           JSON API used by the dashboard (/api/jobs: jobs captured from LightBurn's relay)
+                     (POST /api/laser/command {"cmd": pause|resume|stop} commands the laser;
+                      resume needs {"password"} when the update password is set)
 
 When no camera is usable, /stream and /snapshot serve a "Camera not connected" image
 (placeholder.jpg) instead of hanging, and switch back to live video automatically.
@@ -46,7 +47,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "2.15"
+VERSION = "2.18"
 LBCAM_HOME = os.environ.get("LBCAM_HOME", "/opt/lbcam")
 
 # ======================================================================== V4L2
@@ -1230,9 +1231,12 @@ MEM = {  # address -> key (addresses are 14-bit: byte pair hi*128+lo)
     0x0201: "open_time", 0x0202: "work_time", 0x0203: "work_count", 0x0205: "doc_count",
     0x0208: "prev_work_time", 0x0211: "laser_time", 0x0320: "file_total", 0x0321: "file_progress",
     0x02FE: "card_id",
+    # The origin (Go to origin target). Two copies; after jogging away from the origin both
+    # kept it while 0x0221/0x0231 followed the head. Verified on an RDC6442G.
+    0x0224: "origin_x", 0x0234: "origin_y", 0x0229: "origin_x2", 0x0239: "origin_y2",
 }
 MEM_FAST = (0x0200, 0x0221, 0x0231, 0x0241, 0x0251, 0x0320, 0x0321, 0x0203, 0x0208, 0x0211)
-MEM_SLOW = (0x0201, 0x0202, 0x0205, 0x02FE)
+MEM_SLOW = (0x0201, 0x0202, 0x0205, 0x02FE, 0x0224, 0x0234, 0x0229, 0x0239)
 # Status bits as seen on an RDC6442G: bit 0 = busy (job or manual move); during a job bit 9
 # (0x200) is clear and bit 1 means paused. Jogging sets bits 0 and 9 (and 1), and the job file
 # total reads FILE_TOTAL_UNKNOWN. (MeerK40t calls bit 1 "part end"; on hardware it is paused.)
@@ -1249,9 +1253,11 @@ NOT_FIRING_AFTER = 20.0
 RUIDA_COMMANDS = {
     "pause":  (b"\xD8\x02", ("running",)),
     "resume": (b"\xD8\x03", ("paused",)),
-    "stop":   (b"\xD8\x01", ("running", "paused")),
+    "stop":   (b"\xD8\x01", ("running", "paused", "moving")),
 }
 RUIDA_ACK, RUIDA_NAK = 0xCC, 0xCF
+SEND_WAIT = 1.0  # s to wait for the ACK of one command packet
+SEND_BUDGET = 2 * SEND_WAIT  # one send plus the single resend after a NAK
 
 
 def _swz(b, m):
@@ -1365,7 +1371,7 @@ def _ruida_send(self, payload, magic):
     except (BlockingIOError, InterruptedError, OSError):
         pass
     self.sock.sendto(ruida_packet(payload, magic), self.addr)
-    end = time.time() + 1.0
+    end = time.time() + SEND_WAIT
     while time.time() < end:
         try:
             self.sock.settimeout(max(0.01, end - time.time()))
@@ -1383,6 +1389,131 @@ def _ruida_send(self, payload, magic):
 
 
 RuidaUDP.send = _ruida_send
+
+
+# ---- head moves: Go to origin and Frame, built the way LightBurn builds them.
+# Recorded from LightBurn on an RDC6442G: laser power set to 0 first, speed with C9 02, then
+# D9 10 00 <x> <y> rapid moves to absolute positions in µm (laser off).
+FRAME_SPEED = 100.0      # mm/s, what LightBurn used for framing and Go to origin
+MAX_COORD = 3000000      # µm: no laser bed is bigger than 3 m; anything beyond is garbage
+POWER_OFF_ORIGIN = (b"\xC6\x01\x00\x00", b"\xC6\x21\x00\x00")  # as LightBurn's Go to origin
+POWER_OFF_FRAME = (b"\xC6\x01\x00\x00", b"\xC6\x02\x00\x00", b"\xC6\x21\x00\x00", b"\xC6\x22\x00\x00")
+_RUIDA_TOKEN = re.compile(rb"[\x80-\xff][\x00-\x7f]*")
+
+
+def ruida_speed(mm_s):
+    return b"\xC9\x02" + encode35(int(round(mm_s * 1000)))
+
+
+def ruida_rapid(x, y):
+    x, y = int(round(x)), int(round(y))
+    if not (0 <= x <= MAX_COORD and 0 <= y <= MAX_COORD):
+        raise RuidaCommandError("position %.1f, %.1f mm is outside the machine" % (x / 1000.0, y / 1000.0))
+    return b"\xD9\x10\x00" + encode35(x) + encode35(y)
+
+
+def origin_packets(x, y):
+    return [ruida_speed(FRAME_SPEED)] + list(POWER_OFF_ORIGIN) + [ruida_rapid(x, y)]
+
+
+def frame_packets(points, back):
+    """Trace a closed outline at FRAME_SPEED with the laser at 0 power, then go back to `back`."""
+    pts = list(points)
+    if pts[0] != pts[-1]:
+        pts.append(pts[0])
+    return ([ruida_speed(0)] + list(POWER_OFF_FRAME) + [ruida_rapid(*pts[0]), ruida_speed(FRAME_SPEED)]
+            + [ruida_rapid(*p) for p in pts[1:]] + [ruida_speed(0), ruida_rapid(*back)])
+
+
+def path_seconds(points, speed=FRAME_SPEED):
+    d = sum(((b[0] - a[0]) ** 2 + (b[1] - a[1]) ** 2) ** 0.5 for a, b in zip(points, points[1:]))
+    return d / 1000.0 / speed
+
+
+def _rel14(b):
+    v = ((b[0] & 0x7F) << 7) | (b[1] & 0x7F)
+    return v - 0x4000 if v >= 0x2000 else v
+
+
+def ruida_job_geometry(data):
+    """Cut endpoints of a job (µm), their bounds, and whether it is placed absolutely.
+
+    "Absolute" (LightBurn's Start From: Absolute Coords) means: the header's top-left (E7 03)
+    and bottom-right (E7 07) are present, match the cuts, and an absolute move comes before the
+    first cut. Only then do the file's coordinates say where the job lands on the bed."""
+    x = y = 0
+    pts, header, abs_seen, abs_first = set(), {}, False, None
+    for m in _RUIDA_TOKEN.finditer(data):
+        t = m.group()
+        c, p = t[0], t[1:]
+        nx = None
+        if c == 0x88 and len(p) >= 10:
+            x, y, abs_seen = decode35(p[:5]), decode35(p[5:10]), True
+        elif c == 0x89 and len(p) >= 4:
+            x, y = x + _rel14(p), y + _rel14(p[2:])
+        elif c == 0x8A and len(p) >= 2:
+            x += _rel14(p)
+        elif c == 0x8B and len(p) >= 2:
+            y += _rel14(p)
+        elif c == 0xA8 and len(p) >= 10:
+            nx, ny, abs_seen = decode35(p[:5]), decode35(p[5:10]), True
+        elif c == 0xA9 and len(p) >= 4:
+            nx, ny = x + _rel14(p), y + _rel14(p[2:])
+        elif c == 0xAA and len(p) >= 2:
+            nx, ny = x + _rel14(p), y
+        elif c == 0xAB and len(p) >= 2:
+            nx, ny = x, y + _rel14(p)
+        elif c == 0xE7 and len(p) >= 11 and p[0] in (0x03, 0x07):
+            header[p[0]] = (decode35(p[1:6]), decode35(p[6:11]))
+        if nx is not None:
+            if abs_first is None:
+                abs_first = abs_seen
+            pts.add((x, y))
+            pts.add((nx, ny))
+            x, y = nx, ny
+    if not pts:
+        return {"points": pts, "bounds": None, "absolute": False}
+    xs, ys = [q[0] for q in pts], [q[1] for q in pts]
+    bounds = (min(xs), min(ys), max(xs), max(ys))
+    hb = (header[3] + header[7]) if 3 in header and 7 in header else None
+    absolute = bool(abs_first and hb and all(abs(a - b) <= 1000 for a, b in zip(hb, bounds)))
+    return {"points": pts, "bounds": bounds, "absolute": absolute}
+
+
+def convex_hull(points):
+    """Monotone chain; counter-clockwise, first point not repeated."""
+    pts = sorted(set(points))
+    if len(pts) <= 2:
+        return pts
+
+    def cross(o, a, b):
+        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+    lower, upper = [], []
+    for p in pts:
+        while len(lower) >= 2 and cross(lower[-2], lower[-1], p) <= 0:
+            lower.pop()
+        lower.append(p)
+    for p in reversed(pts):
+        while len(upper) >= 2 and cross(upper[-2], upper[-1], p) <= 0:
+            upper.pop()
+        upper.append(p)
+    return lower[:-1] + upper[:-1]
+
+
+def frame_outline(geo, kind):
+    """Points of a box or rubber-band ("outline") frame for a job geometry."""
+    if not geo["bounds"]:
+        raise RuidaCommandError("the job has no cuts to frame")
+    if not geo["absolute"]:
+        raise RuidaCommandError("the job isn't placed with absolute coordinates, so its position "
+                                "on the bed isn't known (LightBurn: Start From \"Absolute Coords\")")
+    x0, y0, x1, y1 = geo["bounds"]
+    if kind == "box":
+        return [(x0, y0), (x0, y1), (x1, y1), (x1, y0), (x0, y0)]
+    if kind == "outline":
+        hull = convex_hull(geo["points"])
+        return hull + hull[:1]
+    raise RuidaCommandError("unknown frame type")
 
 
 class NetNS:
@@ -1469,6 +1600,9 @@ class Ruida:
         self.cmd = None  # {"name", "payload", "who", "done": Event, "result"}
         self.scan_job = None  # {"start", "count", "done": Event, "result"}
         self.cmd_lock = threading.Lock()
+        self.on_run_end = None  # (run dict) -> None, called when a job run ends (JobCapture)
+        self.motion = None  # {"name", "build", "who", "done", "error", "result"}: Go to origin / Frame
+        self.motion_until = 0.0  # Stop is allowed until then (the head may still be moving)
         self.updated = None
         self.ns = None
 
@@ -1508,6 +1642,8 @@ class Ruida:
                 link = self.laser.link()[1]
                 if link and self.cmd:
                     self._do_command(transport)
+                if link and self.motion:
+                    self._do_motion(transport)
                 if link and self.scan_job:
                     self._do_scan(transport)
                 if not link:
@@ -1542,26 +1678,128 @@ class Ruida:
             available, state = self.state.get("available"), self.values.get("state")
         if not self.enabled or not available or self.magic is None:
             raise RuidaCommandError("the controller isn't connected")
-        if state not in allowed:
+        if state not in allowed and not (name == "stop" and self.motion_busy()):  # incl. a move still queued
             raise RuidaCommandError("can't %s while the laser is %s" % (name, state or "unknown"))
-        job = {"name": name, "payload": payload, "who": who, "done": threading.Event(), "result": None}
+        job = {"name": name, "payload": payload, "who": who, "done": threading.Event(), "result": None,
+               "sent": False}
         with self.cmd_lock:
             if self.cmd:
                 raise RuidaCommandError("another command is still being sent")
+            if name == "stop" and self.motion and not self.motion.get("started"):
+                self.motion["cancel"] = True  # a frame/move not started yet must not run after the Stop
             self.cmd = job
         self.wake.set()
         if not job["done"].wait(timeout):
-            with self.cmd_lock:
-                if self.cmd is job:
-                    self.cmd = None
-            raise RuidaCommandError("the Bridge couldn't send it in time")
+            with self.cmd_lock:  # the worker sets "sent" under this lock, so this check is final
+                if not job["sent"]:
+                    if self.cmd is job:
+                        self.cmd = None
+                    raise RuidaCommandError("the Bridge couldn't send it in time (it was not sent)")
+            # Already on the wire: its answer is due within SEND_BUDGET. Never report "failed" for
+            # a command that may have run.
+            if not job["done"].wait(SEND_BUDGET + 1):
+                raise RuidaCommandError("it was sent but the result is unknown - check the machine")
         if job["result"] != "ack":
             raise RuidaCommandError("the laser didn't confirm it (%s) - check the machine"
                                     % (job["result"] or "no answer"))
         return True
 
+    def _service_command(self, transport):
+        """Called between reads, so a command (Stop!) never waits behind a whole poll or scan."""
+        if self.cmd and not self.cmd["sent"]:
+            self._do_command(transport)
+
+    # ---- head moves (Go to origin, Frame): a list of packets, built in the worker from fresh reads
+    def move(self, name, build, who="?", timeout=30.0):
+        """build(transport, magic) -> (packets, seconds the move takes). Idle only. Raises
+        RuidaCommandError with a reason; returns {"packets", "sent", "seconds"}."""
+        with self.lock:
+            available, state = self.state.get("available"), self.values.get("state")
+        if not self.enabled or not available or self.magic is None:
+            raise RuidaCommandError("the controller isn't connected")
+        if state != "idle":
+            raise RuidaCommandError("only while the laser is idle (it is %s)" % (state or "unknown"))
+        job = {"name": name, "build": build, "who": who, "done": threading.Event(), "error": None, "result": None}
+        with self.cmd_lock:
+            if self.motion or self.cmd or self.scan_job:
+                raise RuidaCommandError("busy, try again in a moment")
+            self.motion = job
+        self.wake.set()
+        if not job["done"].wait(timeout):
+            raise RuidaCommandError("the Bridge couldn't finish sending it in time - check the machine")
+        if job["error"]:
+            raise RuidaCommandError(job["error"])
+        return job["result"]
+
+    def motion_busy(self):
+        return bool(self.motion) or time.time() < self.motion_until
+
+    def _do_motion(self, t):
+        job = self.motion
+        packets, seconds, sent = [], 0.0, 0
+        with self.cmd_lock:
+            job["started"] = True
+            cancelled = job.get("cancel")
+        if cancelled:
+            job["error"] = "cancelled by stop before it started"
+        else:
+            try:
+                packets, seconds = job["build"](t, self.magic)
+            except RuidaCommandError as e:
+                job["error"] = str(e)
+        if packets:
+            self.motion_until = time.time() + 10 + seconds  # Stop stays allowed while it moves
+        for i, pkt in enumerate(packets):
+            if self.cmd and not self.cmd["sent"]:  # Stop (or Pause) arrived: don't send the rest
+                job["error"] = "interrupted by %s after %d of %d parts" % (self.cmd["name"], i, len(packets))
+                self._do_command(t)
+                break
+            try:
+                res = t.send(pkt, self.magic)
+                if res == "nak":  # checksum rejected: it did not run, safe to send once more
+                    res = t.send(pkt, self.magic)
+            except OSError as e:
+                res = "error: %s" % e
+            if res != "ack":
+                job["error"] = ("the laser didn't confirm part %d of %d (%s) - check the machine"
+                                % (i + 1, len(packets), res or "no answer"))
+                break
+            sent += 1
+        job["result"] = {"packets": len(packets), "sent": sent, "seconds": round(seconds, 1)}
+        log("laser %s from %s: %d/%d parts sent%s" % (job["name"], job["who"], sent, len(packets),
+                                                      " - " + job["error"] if job["error"] else ""))
+        with self.cmd_lock:
+            self.motion = None
+        job["done"].set()
+        self.want()
+
+    @staticmethod
+    def _read_all(t, magic, addrs):
+        vals = [t.read(a, magic) for a in addrs]
+        if any(v is None for v in vals):
+            raise RuidaCommandError("couldn't read the controller's position - try again")
+        return vals
+
+    def go_to_origin(self, who="?"):
+        def build(t, magic):
+            ox, oy, ox2, oy2, cx, cy = self._read_all(t, magic, (0x0224, 0x0234, 0x0229, 0x0239, 0x0221, 0x0231))
+            if (ox, oy) != (ox2, oy2):
+                raise RuidaCommandError("the controller's two origin values disagree (%.1f, %.1f vs %.1f, %.1f mm)"
+                                        " - not moving" % (ox / 1000.0, oy / 1000.0, ox2 / 1000.0, oy2 / 1000.0))
+            return origin_packets(ox, oy), path_seconds([(cx, cy), (ox, oy)])
+        return self.move("go to origin", build, who)
+
+    def frame(self, outline, who="?", label="frame"):
+        """Trace outline (µm points) and return to where the head was."""
+        def build(t, magic):
+            cx, cy = self._read_all(t, magic, (0x0221, 0x0231))
+            pts = [(cx, cy)] + list(outline) + [(cx, cy)]
+            return frame_packets(outline, (cx, cy)), path_seconds(pts)
+        return self.move(label, build, who)
+
     # ---- diagnostics: read a range of controller memory (read-only, same reads as status)
-    SCAN_MAX = 2048
+    SCAN_MAX = 512           # ~30 s worst case at 0.06 s per address
+    SCAN_STATUS_EVERY = 64   # re-read the status this often and stop if the laser got busy
 
     def scan(self, start, count, who="?"):
         """{address: value} for every address in range that answers. Only while idle."""
@@ -1586,8 +1824,14 @@ class Ruida:
 
     def _do_scan(self, transport):
         job = self.scan_job
-        t0, out, missing = time.time(), {}, 0
-        for addr in range(job["start"], job["start"] + job["count"]):
+        t0, out, missing, aborted = time.time(), {}, 0, None
+        for i, addr in enumerate(range(job["start"], job["start"] + job["count"])):
+            self._service_command(transport)
+            if i and i % self.SCAN_STATUS_EVERY == 0:
+                st = transport.read(0x0200, self.magic, timeout=0.2, tries=1)
+                if st is not None and st & STATUS_BUSY:
+                    aborted = "the laser became busy"
+                    break
             v = transport.read(addr, self.magic, timeout=0.06, tries=1)
             if v is None:
                 missing += 1
@@ -1595,17 +1839,23 @@ class Ruida:
                 out["0x%04X" % addr] = v
         job["result"] = {"start": "0x%04X" % job["start"], "count": job["count"], "answered": len(out),
                          "missing": missing, "seconds": round(time.time() - t0, 1), "values": out}
-        log("controller memory scan 0x%04X+%d from %s: %d answered in %.1fs"
-            % (job["start"], job["count"], job["who"], len(out), time.time() - t0))
+        if aborted:
+            job["result"]["aborted"] = aborted
+        log("controller memory scan 0x%04X+%d from %s: %d answered in %.1fs%s"
+            % (job["start"], job["count"], job["who"], len(out), time.time() - t0,
+               " (stopped: %s)" % aborted if aborted else ""))
         with self.cmd_lock:
             self.scan_job = None
         job["done"].set()
+        if aborted:
+            self.want()
 
     def _do_command(self, transport):
         with self.cmd_lock:
             job = self.cmd
-        if not job:
-            return
+            if not job or job["sent"]:
+                return
+            job["sent"] = True  # from here on the command may run: command() must not call it failed
         try:
             res = transport.send(job["payload"], self.magic)
             if res == "nak":  # checksum rejected: it did not run, safe to send once more
@@ -1636,6 +1886,7 @@ class Ruida:
             slow = True
         got = {}
         for addr in MEM_FAST + (MEM_SLOW if slow else ()):
+            self._service_command(t)
             v = t.read(addr, self.magic)
             if v is None and addr == 0x0200:
                 return False
@@ -1702,6 +1953,11 @@ class Ruida:
         lj = self.last_job
         if lj and lj["result"] == "stopped" and now < self.recheck_until and self._counted(lj.get("count0"), count):
             lj["result"], lj["progress"] = "finished", 100.0
+            if self.on_run_end:
+                try:
+                    self.on_run_end(lj)  # replaces the "stopped" entry in the job history
+                except Exception as e:
+                    log("job history: %s" % e)
         v["elapsed"] = round(now - self.job["start"]) if self.job else None
         j = self.job
         v["not_firing"] = bool(j and not j["fired"] and j["laser0"] is not None
@@ -1711,6 +1967,9 @@ class Ruida:
             log("laser job has run %ds without firing - alarm on the panel?" % j["run_s"])
         v["progress"] = progress if self.job else None
         v["position"] = {k: round(r[k] / 1000.0, 2) for k in ("x", "y", "z", "u") if k in r}
+        if r.get("origin_x") is not None and (r.get("origin_x"), r.get("origin_y")) == (r.get("origin_x2"), r.get("origin_y2")):
+            v["origin"] = {"x": round(r["origin_x"] / 1000.0, 2), "y": round(r["origin_y"] / 1000.0, 2)}
+        v["motion"] = self.motion_busy()
         # U often reads a fixed value on machines without a rotary: show it once it has moved
         if "u" in r:
             self.first_u = r["u"] if self.first_u is None else self.first_u
@@ -1735,8 +1994,14 @@ class Ruida:
             return  # no job file progress at all: framing or a move, not a job
         else:
             result = "stopped"
-        self.last_job = {"seconds": round(now - job["start"]), "ended": now, "result": result,
-                         "progress": 100.0 if result == "finished" else last, "count0": job["count0"]}
+        self.last_job = {"start": job["start"], "seconds": round(now - job["start"]), "ended": now,
+                         "result": result, "progress": 100.0 if result == "finished" else last,
+                         "count0": job["count0"]}
+        if self.on_run_end:
+            try:
+                self.on_run_end(self.last_job)
+            except Exception as e:  # never break status polling over the job history
+                log("job history: %s" % e)
         self.recheck_until = now + 15
         log("laser job %s after %ds%s" % (result, self.last_job["seconds"],
                                           "" if result == "finished" else " at %.0f%%" % last))
@@ -1750,6 +2015,443 @@ class Ruida:
             out["magic"] = "0x%02X" % self.magic if self.magic else None
             out["raw"] = dict(self.raw)
             return out
+
+
+# ================================================================== job capture
+# LightBurn's relay sends each job to the controller over eth0 (UDP port 50200). We copy those
+# packets from a packet socket, passively: nothing is ever sent, so neither the relay nor the
+# laser can be disturbed. Jobs are stored as the plain (unswizzled) Ruida byte stream; the
+# dashboard decodes and draws them.
+ETH_P_ALL = 0x0003  # all protocols: a socket bound to IPv4 only never sees frames this host sends
+JOB_EOF = 0xD7           # Ruida "end of file"
+JOB_GAP = 10.0           # s without job data that also ends a job (no EOF seen)
+JOB_KEEP = 10            # jobs kept on disk
+JOB_MAX_BYTES = 32 << 20  # bigger than this: not kept
+JOB_CUT_BYTES = (0xA8, 0xA9, 0xAA, 0xAB)  # cut abs / rel / rel x / rel y
+RUN_MATCH_BEFORE = 600.0  # a run belongs to the job captured up to this long before it started
+JOB_ID_RE = re.compile(r"^[0-9]{8}-[0-9]{6}-[0-9a-f]{6}$")
+
+
+def parse_udp_frame(frame):
+    """(src_ip, src_port, dst_ip, dst_port, payload) of an Ethernet/IPv4/UDP frame, else None."""
+    if len(frame) < 42 or frame[12:14] != b"\x08\x00":
+        return None
+    ip = frame[14:]
+    if ip[0] >> 4 != 4 or ip[9] != 17:
+        return None
+    ihl = (ip[0] & 0x0F) * 4
+    if struct.unpack(">H", ip[6:8])[0] & 0x3FFF:  # a fragment (more-fragments flag or offset)
+        return None
+    total = struct.unpack(">H", ip[2:4])[0]
+    udp = ip[ihl:total]
+    if len(udp) < 8:
+        return None
+    sport, dport, ulen = struct.unpack(">HHH", udp[:6])
+    return socket.inet_ntoa(ip[12:16]), sport, socket.inet_ntoa(ip[16:20]), dport, bytes(udp[8:ulen])
+
+
+def job_cuts(data):
+    """Number of cut commands. Ruida parameter bytes are 7-bit, so any of these bytes is a command."""
+    return sum(data.count(bytes((c,))) for c in JOB_CUT_BYTES)
+
+
+class JobStore:
+    """The last JOB_KEEP captured jobs: <id>.rd files plus index.json."""
+
+    def __init__(self, path, keep=JOB_KEEP):
+        self.path, self.keep = path, keep
+        self.lock = threading.Lock()
+        os.makedirs(path, exist_ok=True)
+        self.index = self._load()
+        self.unmatched = []  # runs that started while their job was still being captured
+
+    def _file(self, jid):
+        return os.path.join(self.path, jid + ".rd")
+
+    def _load(self):
+        try:
+            with open(os.path.join(self.path, "index.json")) as f:
+                idx = json.load(f)
+            return [j for j in idx if JOB_ID_RE.match(str(j.get("id"))) and os.path.isfile(self._file(j["id"]))]
+        except (OSError, ValueError, AttributeError, TypeError):
+            return []
+
+    def _save(self):
+        tmp = os.path.join(self.path, "index.json.tmp")
+        with open(tmp, "w") as f:
+            json.dump(self.index, f)
+        os.replace(tmp, os.path.join(self.path, "index.json"))
+
+    def add(self, data, start, end, complete):
+        jid = time.strftime("%Y%m%d-%H%M%S", time.localtime(start)) + "-" + hashlib.sha1(data).hexdigest()[:6]
+        geo = ruida_job_geometry(data)
+        entry = {"id": jid, "start": start, "end": end, "bytes": len(data), "cuts": job_cuts(data),
+                 "complete": complete, "runs": [], "absolute": geo["absolute"],
+                 "bounds": list(geo["bounds"]) if geo["bounds"] else None}
+        with self.lock:
+            with open(self._file(jid), "wb") as f:
+                f.write(data)
+            self.index = [j for j in self.index if j["id"] != jid] + [entry]
+            for run in list(self.unmatched):
+                if self._matches(entry, run):
+                    entry["runs"].append(run)
+                    self.unmatched.remove(run)
+            for old in self.index[:-self.keep]:
+                try:
+                    os.unlink(self._file(old["id"]))
+                except OSError:
+                    pass
+            self.index = self.index[-self.keep:]
+            self._save()
+        return jid
+
+    @staticmethod
+    def _matches(job, run):
+        return run["start"] - RUN_MATCH_BEFORE <= job["start"] <= run["start"] + 5
+
+    def match(self, run_start):
+        """Id of the job a run that started at run_start is most likely running, else None."""
+        with self.lock:
+            for j in reversed(self.index):
+                if self._matches(j, {"start": run_start}):
+                    return j["id"]
+        return None
+
+    def attach_run(self, run, capturing_since=None):
+        """Record how a run ended on the job it ran. A job still being captured gets it when stored."""
+        run = {k: run.get(k) for k in ("start", "seconds", "result", "progress")}
+        with self.lock:
+            if capturing_since is not None and capturing_since <= run["start"] + 5:
+                self.unmatched = [r for r in self.unmatched if r["start"] != run["start"]][-5:] + [run]
+                return
+            for j in reversed(self.index):
+                if self._matches(j, run):
+                    runs = [r for r in j.get("runs", []) if r["start"] != run["start"]]  # a correction
+                    j["runs"] = runs[-9:] + [run]
+                    self._save()
+                    return
+
+    def list(self):
+        with self.lock:
+            return [dict(j) for j in reversed(self.index)]
+
+    def read(self, jid):
+        if not JOB_ID_RE.match(jid):
+            return None
+        with self.lock:
+            if not any(j["id"] == jid for j in self.index):
+                return None
+            try:
+                with open(self._file(jid), "rb") as f:
+                    return f.read()
+            except OSError:
+                return None
+
+    def clear(self):
+        with self.lock:
+            for j in self.index:
+                try:
+                    os.unlink(self._file(j["id"]))
+                except OSError:
+                    pass
+            self.index, self.unmatched = [], []
+            self._save()
+
+
+class JobAssembler:
+    """Turns the relay's packets into job files.
+
+    A packet is kept once the controller ACKs it (or the next, different packet goes out);
+    a resend of the same packet replaces it, a NAK drops it. LightBurn's own status polls
+    (single DA 00 reads) are left out. A job ends at Ruida's EOF byte, or after JOB_GAP s
+    of silence. Streams without a single cut (framing, jogging) aren't kept.
+    """
+
+    def __init__(self, store, magic_fn, clock=time.time):
+        self.store, self.magic_fn, self.clock = store, magic_fn, clock
+        self.lock = threading.Lock()
+        self.pending = None
+        self.buf, self.started, self.last = bytearray(), None, None
+        self.stats = {"packets": 0, "replies": 0, "bad_checksum": 0, "no_magic": 0, "resent": 0, "nak": 0,
+                      "jobs": 0, "ignored": 0}
+
+    def to_controller(self, payload):
+        if len(payload) < 3:
+            return
+        body = payload[2:]
+        if struct.unpack(">H", payload[:2])[0] != sum(body) & 0xFFFF:
+            self.stats["bad_checksum"] += 1
+            return
+        magic = self.magic_fn()
+        if magic is None:  # not known until the status reader has talked to the controller
+            self.stats["no_magic"] += 1
+            return
+        d = ruida_unswizzle(body, magic)
+        with self.lock:
+            self.stats["packets"] += 1
+            if self.pending is not None:
+                if d == self.pending:
+                    self.stats["resent"] += 1
+                    return
+                self._commit()
+            self.pending = d
+
+    def from_controller(self, payload):
+        magic = self.magic_fn()
+        if magic is None or not payload:
+            return
+        with self.lock:
+            self.stats["replies"] += 1
+            if self.pending is None:
+                return
+            if len(payload) == 1 and ruida_unswizzle(payload, magic)[0] == RUIDA_NAK:
+                self.stats["nak"] += 1
+                self.pending = None  # rejected: LightBurn sends it again
+            else:  # ACK, or the answer to a read
+                self._commit()
+
+    def _commit(self):
+        d, self.pending = self.pending, None
+        if len(d) == 4 and d[:2] == b"\xDA\x00":
+            return  # status poll
+        now = self.clock()
+        if not self.buf:
+            self.started = now
+        self.buf += d
+        self.last = now
+        while True:
+            i = self.buf.find(bytes((JOB_EOF,)))
+            if i < 0:
+                break
+            data = bytes(self.buf[:i + 1])
+            del self.buf[:i + 1]
+            self._finish(data, True, self.started, now)
+            self.started = now if self.buf else None
+        if len(self.buf) > JOB_MAX_BYTES:
+            log("job capture: over %d MB without an end, dropped" % (JOB_MAX_BYTES >> 20))
+            self.buf, self.started = bytearray(), None
+
+    def _finish(self, data, complete, start, end):
+        cuts = job_cuts(data)
+        if not cuts:
+            self.stats["ignored"] += 1
+            return
+        try:
+            jid = self.store.add(data, start, end, complete)
+        except OSError as e:
+            log("job capture: can't store job: %s" % e)
+            return
+        self.stats["jobs"] += 1
+        log("job captured: %s, %d bytes, %d cuts%s" % (jid, len(data), cuts, "" if complete else " (no end seen)"))
+
+    def tick(self):
+        """Call regularly: ends a job after JOB_GAP s of silence."""
+        with self.lock:
+            now = self.clock()
+            if self.pending is not None and self.last is not None and now - self.last > JOB_GAP:
+                self._commit()
+            if self.buf and now - self.last > JOB_GAP:
+                data, start = bytes(self.buf), self.started
+                self.buf, self.started = bytearray(), None
+                self._finish(data, False, start, self.last)
+
+    def live(self):
+        """The job being captured right now, if it has cuts: (start, bytes)."""
+        with self.lock:
+            buf = bytes(self.buf) + (self.pending or b"")
+            start = self.started
+        if not buf or not job_cuts(buf):
+            return None, None
+        return start or self.clock(), buf
+
+
+class PacketRecorder:
+    """Timed recording of everything LightBurn's relay and the controller send each other, decoded.
+    Diagnostics: e.g. press Home or Frame in LightBurn and see exactly which commands it uses.
+    Passive like the job capture; LightBurn's status polls are only counted."""
+
+    MAX_SECONDS, MAX_PACKETS, MAX_SHOWN = 120, 3000, 256
+
+    def __init__(self, clock=time.time):
+        self.clock = clock
+        self.lock = threading.Lock()
+        self.until, self.t0 = 0.0, None
+        self.packets, self.counts = [], {}
+
+    def start(self, seconds):
+        seconds = max(5, min(int(seconds), self.MAX_SECONDS))
+        with self.lock:
+            self.t0 = self.clock()
+            self.until = self.t0 + seconds
+            self.packets, self.counts = [], {"polls": 0, "acks": 0, "dropped": 0, "bad_checksum": 0}
+        return seconds
+
+    def active(self):
+        return self.clock() < self.until
+
+    @staticmethod
+    def commands(d):
+        """Split into commands: every byte >= 0x80 starts one (Ruida parameters are 7-bit)."""
+        out, cur = [], []
+        for b in d[:PacketRecorder.MAX_SHOWN]:
+            if b >= 0x80 and cur:
+                out.append(" ".join("%02X" % x for x in cur))
+                cur = []
+            cur.append(b)
+        if cur:
+            out.append(" ".join("%02X" % x for x in cur))
+        if len(d) > PacketRecorder.MAX_SHOWN:
+            out.append("... (%d bytes in all)" % len(d))
+        return out
+
+    def add(self, direction, payload, magic):
+        if not self.active() or not payload:
+            return
+        with self.lock:
+            c = self.counts
+            if magic is None:
+                d, note = bytes(payload), "swizzled (magic not known yet)"
+            elif direction == "out":
+                if len(payload) < 3 or struct.unpack(">H", payload[:2])[0] != sum(payload[2:]) & 0xFFFF:
+                    c["bad_checksum"] += 1
+                    return
+                d, note = ruida_unswizzle(payload[2:], magic), None
+            else:
+                d, note = ruida_unswizzle(payload, magic), None
+            if note is None:
+                if direction == "out" and len(d) == 4 and d[:2] == b"\xDA\x00":
+                    c["polls"] += 1
+                    return
+                if direction == "in" and d[:2] == b"\xDA\x01":
+                    return  # answer to a poll
+                if direction == "in" and d == bytes((RUIDA_ACK,)):
+                    c["acks"] += 1
+                    return
+            if len(self.packets) >= self.MAX_PACKETS:
+                c["dropped"] += 1
+                return
+            p = {"t": round(self.clock() - self.t0, 3), "dir": direction, "bytes": len(d), "cmds": self.commands(d)}
+            if note:
+                p["note"] = note
+            self.packets.append(p)
+
+    def status(self):
+        with self.lock:
+            now = self.clock()
+            return {"active": now < self.until, "remaining": max(0, round(self.until - now)),
+                    "started": self.t0, "packets": list(self.packets), "counts": dict(self.counts)}
+
+
+class JobCapture:
+    """Background thread: reads eth0 with a packet socket and feeds the assembler."""
+
+    def __init__(self, laser, ruida, store, enabled=None):
+        self.laser, self.ruida, self.store = laser, ruida, store
+        self.enabled = (os.environ.get("LBCAM_JOBS", "1") != "0") if enabled is None else enabled
+        self.asm = JobAssembler(store, lambda: ruida.magic if ruida else None)
+        self.rec = PacketRecorder()
+        self.state = "starting" if self.enabled else "turned off (LBCAM_JOBS=0)"
+        self.laser_ip, self.ip_at = None, 0.0
+        # diagnostics: what the socket actually sees (frames, UDP frames, UDP flows with counts)
+        self.seen = {"frames": 0, "udp": 0, "errors": 0}
+        self.flows = collections.OrderedDict()
+        if ruida:
+            ruida.on_run_end = self._run_ended
+
+    def _run_ended(self, run):
+        with self.asm.lock:
+            since = self.asm.started if self.asm.buf else None
+        self.store.attach_run(run, since)
+
+    def start(self):
+        """Call from the main thread: the capture must see the normal network namespace."""
+        if self.enabled:
+            threading.Thread(target=self.run, daemon=True).start()
+
+    def _open(self):
+        s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(ETH_P_ALL))
+        s.bind((self.laser.iface, 0))
+        s.settimeout(1.0)
+        return s
+
+    def run(self):
+        sock = None
+        while True:
+            if sock is None:
+                try:
+                    sock = self._open()
+                    self.state = "on"
+                    log("job capture: watching %s" % self.laser.iface)
+                except PermissionError:
+                    self.state = "off: needs root"
+                    log("job capture off: needs root")
+                    return
+                except (OSError, AttributeError) as e:
+                    self.state = "off: %s" % e
+                    time.sleep(30)
+                    continue
+            try:
+                frame = sock.recv(65535)
+            except socket.timeout:
+                frame = None
+            except OSError as e:  # interface went away: reopen later
+                log("job capture: %s" % e)
+                sock.close()
+                sock, self.state = None, "off: %s" % e
+                time.sleep(5)
+                continue
+            try:
+                if frame:
+                    self.seen["frames"] += 1
+                    self.handle(parse_udp_frame(frame))
+                self.asm.tick()
+            except Exception as e:  # keep capturing: one odd packet mustn't end it
+                self.seen["errors"] += 1
+                if self.seen["errors"] <= 5:
+                    log("job capture error: %r" % e)
+
+    def handle(self, p):
+        if not p:
+            return
+        src, sport, dst, dport, payload = p
+        self.seen["udp"] += 1
+        key = "%s:%d > %s:%d" % (src, sport, dst, dport)
+        self.flows[key] = self.flows.pop(key, 0) + 1  # most recent last
+        while len(self.flows) > 12:
+            self.flows.popitem(last=False)
+        if self.laser_ip is None or time.time() - self.ip_at > 10:
+            self.laser_ip, self.ip_at = self.laser.bridge_config()["laser_ip"], time.time()
+        mine = self.ruida.ns.ip if self.ruida and self.ruida.ns else None  # our own status reads
+        if dst == self.laser_ip and dport == RUIDA_PORT and src != mine:
+            self.asm.to_controller(payload)
+            self.rec.add("out", payload, self.asm.magic_fn())
+        elif src == self.laser_ip and dport == RUIDA_REPLY_PORT and dst != mine:
+            self.asm.from_controller(payload)
+            self.rec.add("in", payload, self.asm.magic_fn())
+
+    def running_job(self):
+        """Id of the job the laser is running now, "live" if it is still being received, else None."""
+        start = self.ruida.job_started if self.ruida else None
+        if start is None:
+            return None
+        live_start, live = self.asm.live()
+        if live is not None and live_start <= start + 5:
+            return "live"
+        return self.store.match(start)
+
+    def status(self):
+        return {"state": self.state, "stats": dict(self.asm.stats), "seen": dict(self.seen),
+                "flows": dict(self.flows), "laser_ip": self.laser_ip,
+                "own_ip": self.ruida.ns.ip if self.ruida and self.ruida.ns else None}
+
+
+def jobs_dir():
+    d = os.environ.get("LBCAM_JOBS_DIR")
+    if d:
+        return d
+    if os.path.isdir(LBCAM_HOME) and os.access(LBCAM_HOME, os.W_OK):
+        return os.path.join(LBCAM_HOME, "jobs")
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "jobs")
 
 
 def pi_health():
@@ -2145,7 +2847,7 @@ def host_allowed(host_header, extra=None):
     return h in allowed or h.endswith(".local")
 
 
-def make_handler(cam, cfg, dashboard, updater, net=None, laser=None, ruida=None):
+def make_handler(cam, cfg, dashboard, updater, net=None, laser=None, ruida=None, jobs=None):
     health_cache = {"t": 0.0, "v": {}}
 
     class Handler(BaseHTTPRequestHandler):
@@ -2245,18 +2947,28 @@ def make_handler(cam, cfg, dashboard, updater, net=None, laser=None, ruida=None)
                     ruida.want()
                     out["controller"] = ruida.status()
                 return self._json(out)
-            if p == "/api/laser/scan":
-                if not ruida:
+            if p == "/api/jobs":
+                if not jobs:
+                    return self._json({"capture": {"state": "not available"}, "jobs": [], "live": None,
+                                       "running": None})
+                live_start, live = jobs.asm.live()
+                return self._json({"capture": jobs.status(), "jobs": jobs.store.list(),
+                                   "live": {"start": live_start, "bytes": len(live)} if live else None,
+                                   "running": jobs.running_job()})
+            if p == "/api/laser/record":
+                if not jobs:
                     return self._json({"error": "not available"}, 409)
-                q = parse_qs(u.query)
-                try:
-                    start = int((q.get("start") or ["0x200"])[0], 0)
-                    count = int((q.get("count") or ["256"])[0], 0)
-                    return self._json(ruida.scan(start, count, who=self.client_address[0]))
-                except ValueError:
-                    return self._json({"error": "start/count must be numbers"}, 400)
-                except RuidaCommandError as e:
-                    return self._json({"error": str(e)}, 409)
+                return self._json(dict(jobs.rec.status(), capture=jobs.status()["state"]))
+            if p.startswith("/api/jobs/") and p.endswith(".rd"):
+                jid = p[len("/api/jobs/"):-3]
+                data = None
+                if jobs and jid == "live":
+                    data = jobs.asm.live()[1]
+                elif jobs:
+                    data = jobs.store.read(jid)
+                if data is None:
+                    return self._json({"error": "no such job"}, 404)
+                return self._send(200, "application/octet-stream", data, head)
             if p == "/api/health":
                 if time.time() - health_cache["t"] > 5:
                     health_cache["v"], health_cache["t"] = pi_health(), time.time()
@@ -2284,11 +2996,53 @@ def make_handler(cam, cfg, dashboard, updater, net=None, laser=None, ruida=None)
                     if not ruida:
                         return self._json({"error": "laser control isn't available"}, 409)
                     name = str(body.get("cmd") or "")
+                    if name == "resume":
+                        # Resume makes the laser fire again, maybe with nobody at the machine: it
+                        # needs the update password when one is set (Pause/Stop never do).
+                        if updater.password_set() and not body.get("password"):
+                            raise PermissionError("Resume needs the Bridge password")
+                        updater.check_password(body.get("password"))
                     try:
                         ruida.command(name, who=self.client_address[0])
                     except RuidaCommandError as e:
                         return self._json({"error": "Couldn't %s: %s" % (name, e)}, 409)
                     return self._json({"ok": True, "cmd": name})
+                if p in ("/api/laser/origin", "/api/laser/frame"):
+                    if not ruida:
+                        return self._json({"error": "laser control isn't available"}, 409)
+                    who = self.client_address[0]
+                    try:
+                        if p == "/api/laser/origin":
+                            return self._json(dict(ok=True, **ruida.go_to_origin(who=who)))
+                        kind = str(body.get("kind") or "box")
+                        data = jobs.store.read(str(body.get("job") or "")) if jobs else None
+                        if data is None:
+                            raise RuidaCommandError("that job isn't stored on the Bridge")
+                        outline = frame_outline(ruida_job_geometry(data), kind)
+                        return self._json(dict(ok=True, points=len(outline),
+                                               **ruida.frame(outline, who=who, label=kind + " frame")))
+                    except RuidaCommandError as e:
+                        what = "go to origin" if p == "/api/laser/origin" else "frame"
+                        return self._json({"error": "Couldn't %s: %s" % (what, e)}, 409)
+                if p == "/api/laser/scan":  # POST, so the X-LBCam/Origin checks apply
+                    if not ruida:
+                        return self._json({"error": "not available"}, 409)
+                    start, count = (int(str(body.get(k, d)), 0) for k, d in (("start", "0x200"), ("count", "256")))
+                    try:
+                        return self._json(ruida.scan(start, count, who=self.client_address[0]))
+                    except RuidaCommandError as e:
+                        return self._json({"error": str(e)}, 409)
+                if p == "/api/laser/record":
+                    if not jobs or not jobs.enabled:
+                        return self._json({"error": "packet capture is off"}, 409)
+                    secs = jobs.rec.start(body.get("seconds", 30))
+                    log("recording laser traffic for %ds (from %s)" % (secs, self.client_address[0]))
+                    return self._json({"ok": True, "seconds": secs})
+                if p == "/api/jobs/clear":
+                    if jobs:
+                        jobs.store.clear()
+                        log("job history cleared from %s" % self.client_address[0])
+                    return self._json({"ok": True})
                 if p == "/api/network":
                     return self._json(dict(ok=True, **net.apply(body)))
                 if p == "/api/network/confirm":
@@ -2459,13 +3213,19 @@ def main():
     net = Network()
     laser = Laser(iface=os.environ.get("LBCAM_LASER_IFACE", "eth0"))
     ruida = Ruida(laser)
+    jobs = None
+    try:
+        jobs = JobCapture(laser, ruida, JobStore(jobs_dir()))
+        jobs.start()  # from the main thread: Ruida's own thread moves into a network namespace
+    except OSError as e:
+        log("job capture off: can't use %s (%s)" % (jobs_dir(), e))
     ruida.start()
     threading.Thread(target=cam.run, daemon=True).start()
 
     srv = None
     for attempt in range(30):
         try:
-            srv = ThreadingHTTPServer(("0.0.0.0", port), make_handler(cam, cfg, dashboard, updater, net, laser, ruida))
+            srv = ThreadingHTTPServer(("0.0.0.0", port), make_handler(cam, cfg, dashboard, updater, net, laser, ruida, jobs))
             break
         except OSError as e:
             log("port %d unavailable (%s), retrying..." % (port, e))

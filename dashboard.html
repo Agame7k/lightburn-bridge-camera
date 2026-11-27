@@ -109,6 +109,17 @@ details.panel[open] summary h2::after{content:" ▾"}
 #soundBtn{padding:4px 8px;font-size:13px;line-height:1.2}
 #soundBtn.on{border-color:var(--accent);color:var(--accent)}
 @media (max-width:420px){#notes{top:auto;bottom:16px}}
+.jobview{position:relative;border:1px solid var(--line);border-radius:8px;overflow:hidden;background:#fbfaf6}
+.jobview canvas{display:block;width:100%}
+#jobHead{position:absolute;inset:0;pointer-events:none}
+.jobinfo{margin-top:8px;font-size:13px;color:var(--muted);font-variant-numeric:tabular-nums;display:flex;align-items:center;flex-wrap:wrap;gap:4px}
+.swatch{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:2px;border:1px solid var(--line)}
+.joblist{display:flex;flex-direction:column;gap:4px}
+.jobrow{display:flex;justify-content:space-between;gap:10px;text-align:left;padding:7px 10px}
+.jobrow span{color:var(--muted);font-size:12px;font-variant-numeric:tabular-nums}
+.jobrow.on{border-color:var(--accent)}
+a.button{font:inherit;padding:8px 12px;border-radius:7px;border:1px solid var(--line);background:var(--field);color:var(--text);text-decoration:none}
+.rec{margin:10px 0 0;max-height:340px;overflow:auto;background:var(--field);border:1px solid var(--line);border-radius:7px;padding:10px;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap}
 </style>
 </head>
 <body>
@@ -143,6 +154,18 @@ details.panel[open] summary h2::after{content:" ▾"}
       <div class="body" style="padding-top:0">
         <pre id="logText">Loading…</pre>
         <div class="actions"><button id="logCopy">Copy log</button><span class="hint" id="logSrc" style="margin:0;align-self:center"></span></div>
+      </div>
+    </details>
+    <details class="panel" id="recPanel" style="margin-top:16px">
+      <summary><h2 style="display:inline-block;padding:12px 14px">Record laser traffic</h2></summary>
+      <div class="body" style="padding-top:0">
+        <div class="hint" style="margin-top:0">Records what LightBurn sends to the laser through the Bridge, e.g. to see which commands its Home and Frame buttons use. Start recording, press the button in LightBurn, then copy the result. Nothing is sent to the laser; LightBurn's status checks are only counted.</div>
+        <div class="actions">
+          <button class="primary" id="recStart">Record 30 s</button>
+          <button id="recCopy" hidden>Copy recording</button>
+          <span class="hint" id="recState" style="margin:0;align-self:center"></span>
+        </div>
+        <pre id="recText" class="rec" hidden></pre>
       </div>
     </details>
   </section>
@@ -262,7 +285,29 @@ details.panel[open] summary h2::after{content:" ▾"}
           <button id="cPause">❚❚ Pause</button>
           <button id="cResume" class="primary">▶ Resume</button>
           <button id="cStop" class="danger">■ Stop</button>
+          <button id="cOrigin" title="Move the head to the origin set on the laser (laser off), like LightBurn's Go to origin">⌖ Go to origin</button>
         </div>
+      </div>
+    </div>
+
+    <div class="panel" style="margin-top:16px">
+      <h2 id="jobFileTitle">Job file</h2>
+      <div class="body">
+        <div class="jobview"><canvas id="jobCanvas"></canvas><canvas id="jobHead"></canvas></div>
+        <div class="jobinfo" id="jobInfo"></div>
+        <div class="actions">
+          <button id="jobFrame" title="Trace the job's bounding box with the laser off, then return">▭ Frame</button>
+          <button id="jobFrameOutline" title="Trace the outline around the job's cuts with the laser off, then return">◯ Outline frame</button>
+          <button id="jobFollow" hidden>Show current job</button>
+          <button id="jobFlipX" title="Mirror left/right to match your machine">⇋ Mirror</button>
+          <button id="jobFlipY" title="Flip top/bottom to match your machine">⇵ Flip</button>
+          <a class="button" id="jobDownload" hidden>Download raw</a>
+        </div>
+        <div class="sub">Recent jobs</div>
+        <div class="joblist" id="jobList"></div>
+        <div class="actions"><button id="jobClear" hidden>Clear history</button></div>
+        <div class="hint" id="jobCapNote"></div>
+        <div class="hint">Copied from what LightBurn sends to the laser through the Bridge: nothing is sent to the laser to get it. Jobs started from files stored on the laser's panel can't be shown unless they were sent while the Bridge was watching.</div>
       </div>
     </div>
   </section>
@@ -762,8 +807,9 @@ function watchHealth(h){
 /* ---------- laser control buttons (the Bridge re-checks every rule) ---------- */
 const CTL = {
   cPause:  {cmd:"pause",  when:["running"]},
-  cResume: {cmd:"resume", when:["paused"]},
-  cStop:   {cmd:"stop",   when:["running","paused"], ask:"Stop the job?\n\nA stopped job can't be resumed."},
+  cResume: {cmd:"resume", when:["paused"], ask:"Resume the job?\n\nThe laser will start firing again. Only do this if someone is at the machine."},
+  cStop:   {cmd:"stop",   when:["running","paused","moving"], ask:"Stop the job?\n\nA stopped job can't be resumed.", askIf:["running","paused"]},
+  cOrigin: {path:"/api/laser/origin", when:["idle"], done:"Going to origin"},
 };
 let ctlBusy = false;
 function drawControls(c){
@@ -772,17 +818,28 @@ function drawControls(c){
   box.hidden = false;
   for (const [id, d] of Object.entries(CTL)) {
     const b = $("#" + id);
-    b.hidden = !d.when.includes(c.state);
+    b.hidden = !(d.when.includes(c.state) || (d.cmd === "stop" && c.motion));  // Stop also cancels a frame
     b.disabled = ctlBusy;
   }
   if (![...box.children].some(b => !b.hidden)) box.hidden = true;  // e.g. while moving
 }
 for (const [id, d] of Object.entries(CTL)) {
   $("#" + id).addEventListener("click", async () => {
-    if (d.ask && !confirm(d.ask)) return;
+    const st = JV.ctrl && JV.ctrl.state;
+    if (d.ask && (!d.askIf || d.askIf.includes(st)) && !confirm(d.ask)) return;
     ctlBusy = true; document.querySelectorAll("#ctlBtns button").forEach(b => b.disabled = true);
     try {
-      await api("/api/laser/command", {cmd: d.cmd});
+      if (d.path) { await api(d.path, {}); toast(d.done); ctlBusy = false; loadLaser(); return; }
+      const body = {cmd: d.cmd};
+      try { await api("/api/laser/command", body); }
+      catch(e) {
+        if (!/password/i.test(e.message)) throw e;
+        // Resume is protected by the update password (when one is set)
+        const pw = prompt(e.message + "\n\nEnter the Bridge password to resume:");
+        if (pw === null) { ctlBusy = false; loadLaser(); return; }
+        body.password = pw;
+        await api("/api/laser/command", body);
+      }
       toast({pause:"Pause sent", resume:"Resume sent", stop:"Stop sent"}[d.cmd]);
     } catch(e) { notify("bad", "Laser command failed", e.message, true); }
     ctlBusy = false;
@@ -833,6 +890,7 @@ async function loadLaser(fresh){
   if (l.relay && l.relay.message) rows.push(["Last activity", l.relay.message]);
   $("#laserkv").innerHTML = rows.map(([a,b]) => `<dt>${esc(a)}</dt><dd>${esc(b)}</dd>`).join("");
   renderController(l.controller);
+  JV.ctrl = l.controller; if (MONITOR) { jvDraw(); jvFrameButtons(); }
   watchLaser(l);
 }
 const dur = s => { if (s == null) return "—"; s = Math.round(s); const h = Math.floor(s/3600), m = Math.floor(s%3600/60), x = s%60;
@@ -918,6 +976,271 @@ if (!MONITOR) {
   setInterval(loadLog, 3000);
   setInterval(() => { if (!busy) loadSw(); }, 15000);
 }
+
+/* ---------- job file: what the laser was sent, decoded and drawn here (the Bridge only stores it) ---------- */
+/* ruida-parser:start */
+// Plain (unswizzled) Ruida byte stream -> cut segments in µm. Parameter bytes are 7-bit, so every
+// byte >= 0x80 starts a command: unknown commands are skipped without losing sync.
+function parseRuida(b){
+  const abs = i => { let v = 0; for (let k = 0; k < 5; k++) v = v * 128 + (b[i+k] & 0x7F); return v >= 2**34 ? v - 2**35 : v; };
+  const rel = i => { const v = (b[i] & 0x7F) * 128 + (b[i+1] & 0x7F); return v >= 0x2000 ? v - 0x4000 : v; };
+  const segs = [], colors = {}, used = new Set();
+  let x = 0, y = 0, layer = 0, travel = 0, cutLen = 0, eof = false;
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  const move = (nx, ny) => { travel += Math.hypot(nx - x, ny - y); x = nx; y = ny; };
+  const cut = (nx, ny) => {
+    segs.push(x, y, nx, ny, layer); used.add(layer); cutLen += Math.hypot(nx - x, ny - y);
+    minX = Math.min(minX, x, nx); maxX = Math.max(maxX, x, nx); minY = Math.min(minY, y, ny); maxY = Math.max(maxY, y, ny);
+    x = nx; y = ny;
+  };
+  const n = b.length;
+  let i = 0;
+  while (i < n) {
+    const c = b[i];
+    if (c < 0x80) { i++; continue; }
+    let j = i + 1; while (j < n && b[j] < 0x80) j++;
+    const p = j - i - 1;  // parameter bytes
+    switch (c) {
+      case 0x88: if (p >= 10) move(abs(i+1), abs(i+6)); break;            // move absolute
+      case 0x89: if (p >= 4) move(x + rel(i+1), y + rel(i+3)); break;     // move relative
+      case 0x8A: if (p >= 2) move(x + rel(i+1), y); break;
+      case 0x8B: if (p >= 2) move(x, y + rel(i+1)); break;
+      case 0xA8: if (p >= 10) cut(abs(i+1), abs(i+6)); break;             // cut absolute
+      case 0xA9: if (p >= 4) cut(x + rel(i+1), y + rel(i+3)); break;      // cut relative
+      case 0xAA: if (p >= 2) cut(x + rel(i+1), y); break;
+      case 0xAB: if (p >= 2) cut(x, y + rel(i+1)); break;
+      case 0xCA:
+        if (p >= 2 && b[i+1] === 0x02) layer = b[i+2];                      // current layer
+        else if (p >= 7 && b[i+1] === 0x06) colors[b[i+2]] = abs(i+3);      // layer colour
+        break;
+      case 0xD7: eof = true; break;                                         // end of file
+    }
+    i = j;
+  }
+  return {segs, colors, layers: [...used].sort((a, b) => a - b), cuts: segs.length / 5, cutLen, travel, eof,
+          bounds: segs.length ? {minX, minY, maxX, maxY} : null};
+}
+/* ruida-parser:end */
+
+const JV_PALETTE = ["#111111","#0000ff","#e03131","#2b8a3e","#c77c02","#ae3ec9","#0c8599","#e8590c","#5c940d","#1864ab"];
+const JV = {list: null, pinned: null, shown: null, parsed: null, cache: new Map(), liveBytes: -1, liveAt: 0,
+            drawnSig: "", ctrl: null, loading: false,
+            flipX: localStorage.getItem("jvFlipX") === "1", flipY: localStorage.getItem("jvFlipY") === "1"};
+function jvColor(P, L){
+  const v = P.colors[L];
+  return v != null ? `rgb(${v & 255},${(v >> 8) & 255},${(v >> 16) & 255})` : JV_PALETTE[L % JV_PALETTE.length];
+}
+async function jvFetch(id){
+  const r = await fetch("/api/jobs/" + encodeURIComponent(id) + ".rd", {cache: "no-store"});
+  if (!r.ok) throw new Error("HTTP " + r.status);
+  return parseRuida(new Uint8Array(await r.arrayBuffer()));
+}
+function jvGeom(cv, P){
+  const w = cv.clientWidth || 600, h = Math.round(Math.min(w * 0.62, 520)), pad = 14, B = P && P.bounds;
+  if (!B) return {w, h};
+  const bw = Math.max(B.maxX - B.minX, 1), bh = Math.max(B.maxY - B.minY, 1);
+  const s = Math.min((w - 2*pad) / bw, (h - 2*pad) / bh);
+  const ox = (w - bw * s) / 2, oy = (h - bh * s) / 2;
+  return {w, h, s,
+    X: v => ox + (JV.flipX ? B.maxX - v : v - B.minX) * s,
+    Y: v => oy + (JV.flipY ? B.maxY - v : v - B.minY) * s};
+}
+function jvSize(cv, g){
+  const dpr = window.devicePixelRatio || 1;
+  if (cv.width !== Math.round(g.w * dpr) || cv.height !== Math.round(g.h * dpr)) {
+    cv.width = Math.round(g.w * dpr); cv.height = Math.round(g.h * dpr); cv.style.height = g.h + "px";
+  }
+  const ctx = cv.getContext("2d"); ctx.setTransform(dpr, 0, 0, dpr, 0, 0); return ctx;
+}
+function jvDone(P){  // how many segments are done, from the controller's progress (approximate)
+  const c = JV.ctrl;
+  if (!c || !c.running || JV.shown !== (JV.list && JV.list.running) || c.progress == null) return P.cuts;
+  return Math.floor(P.cuts * c.progress / 100);
+}
+function jvDraw(){
+  const cv = $("#jobCanvas"), P = JV.parsed;
+  const g = jvGeom(cv, P), done = P ? jvDone(P) : 0;
+  const sig = [JV.shown, P && P.cuts, done, g.w, JV.flipX, JV.flipY].join("|");
+  if (sig !== JV.drawnSig) {
+    JV.drawnSig = sig;
+    const ctx = jvSize(cv, g);
+    ctx.fillStyle = "#fbfaf6"; ctx.fillRect(0, 0, g.w, g.h);  // paper-like in both themes
+    if (P && P.bounds) {
+      ctx.lineWidth = 1; ctx.lineCap = "round";
+      const S = P.segs;
+      for (const pass of [0, 1]) {  // not done yet (faint), then done
+        const from = pass ? 0 : done, to = pass ? done : P.cuts;
+        ctx.globalAlpha = pass ? 1 : (done < P.cuts && done > 0 ? 0.22 : 1);
+        let k = from;
+        while (k < to) {
+          const L = S[k*5 + 4];
+          ctx.strokeStyle = jvColor(P, L); ctx.beginPath();
+          for (; k < to && S[k*5 + 4] === L; k++) {
+            const o = k * 5; ctx.moveTo(g.X(S[o]), g.Y(S[o+1])); ctx.lineTo(g.X(S[o+2]), g.Y(S[o+3]));
+          }
+          ctx.stroke();
+        }
+      }
+      ctx.globalAlpha = 1;
+    } else {
+      ctx.fillStyle = "#6a717c"; ctx.font = "14px system-ui, sans-serif"; ctx.textAlign = "center";
+      ctx.fillText(P ? "No cuts in this job" : (JV.loading ? "Loading…" : "No job captured yet"), g.w / 2, g.h / 2);
+    }
+  }
+  jvDrawHead(g);
+}
+function jvDrawHead(g){  // laser head on its own canvas, so the paths don't redraw every poll
+  const cv = $("#jobHead"), P = JV.parsed, c = JV.ctrl;
+  g = g || jvGeom($("#jobCanvas"), P);
+  const ctx = jvSize(cv, g); ctx.clearRect(0, 0, g.w, g.h);
+  if (!P || !P.bounds || !c || !c.available || !c.position || c.position.x == null) return;
+  if (JV.shown !== (JV.list && (JV.list.running || (JV.list.jobs[0] || {}).id))) return;  // not the job on the bed
+  const x = g.X(c.position.x * 1000), y = g.Y(c.position.y * 1000);
+  if (x < -20 || y < -20 || x > g.w + 20 || y > g.h + 20) return;  // not over the drawing
+  ctx.strokeStyle = "#d9480f"; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.arc(x, y, 7, 0, 2 * Math.PI); ctx.moveTo(x - 12, y); ctx.lineTo(x + 12, y); ctx.moveTo(x, y - 12); ctx.lineTo(x, y + 12); ctx.stroke();
+}
+function jvCaption(){
+  const P = JV.parsed, L = JV.list, id = JV.shown;
+  const meta = id === "live" ? L && L.live : L && L.jobs.find(j => j.id === id);
+  const parts = [];
+  if (P && P.bounds) {
+    const B = P.bounds;
+    parts.push(((B.maxX - B.minX) / 1000).toFixed(1) + " × " + ((B.maxY - B.minY) / 1000).toFixed(1) + " mm");
+    parts.push(P.cuts.toLocaleString() + " cuts");
+    parts.push((P.cutLen / 1000).toFixed(0) + " mm cut");
+  }
+  const size = n => n < 1024 ? n + " B" : Math.round(n / 1024).toLocaleString() + " KB";
+  if (meta) parts.push(size(meta.bytes));
+  if (id === "live") parts.push("still being received");
+  else if (meta && !meta.complete) parts.push("end of file not seen");
+  if (L && L.running === id && JV.ctrl && JV.ctrl.progress != null) parts.push("done part is approximate");
+  const sw = P && P.layers.length ? P.layers.map(l => `<span class="swatch" style="background:${jvColor(P, l)}"></span>`).join("") : "";
+  $("#jobInfo").innerHTML = sw + esc(parts.join(" · "));
+  const title = !id ? "No job" : L && L.running === id ? "Running now" : id === "live" ? "Being sent" : "Captured " + jvWhen(meta && meta.start);
+  $("#jobFileTitle").textContent = title;
+  const dl = $("#jobDownload"); dl.hidden = !id || id === "live";
+  if (id && id !== "live") { dl.href = "/api/jobs/" + id + ".rd"; dl.download = "job-" + id + ".rd"; }
+  $("#jobFollow").hidden = !JV.pinned;
+}
+function jvWhen(t){
+  if (!t) return "";
+  const d = new Date(t * 1000), today = new Date().toDateString() === d.toDateString();
+  return (today ? "" : d.toLocaleDateString([], {month: "short", day: "numeric"}) + " ") + d.toLocaleTimeString([], {hour: "2-digit", minute: "2-digit"});
+}
+function jvRunText(j, running){
+  if (running) return "running now";
+  const r = (j.runs || [])[j.runs ? j.runs.length - 1 : 0];
+  if (!r) return "not run while watched";
+  return r.result === "finished" ? "finished in " + dur(r.seconds) : "stopped at " + Math.round(r.progress) + "%";
+}
+function jvList(){
+  const L = JV.list, box = $("#jobList");
+  if (!L) return;
+  const rows = [];
+  if (L.live) rows.push({id: "live", start: L.live.start, label: "Being sent now", sub: Math.round(L.live.bytes / 1024) + " KB so far"});
+  for (const j of L.jobs) rows.push({id: j.id, start: j.start, label: jvWhen(j.start),
+    sub: j.cuts.toLocaleString() + " cuts · " + jvRunText(j, L.running === j.id)});
+  box.innerHTML = rows.length ? rows.map(r => `<button class="jobrow${r.id === JV.shown ? " on" : ""}" data-id="${esc(r.id)}"><b>${esc(r.label)}</b><span>${esc(r.sub)}</span></button>`).join("")
+    : `<div class="empty">Jobs you send from LightBurn show up here.</div>`;
+  const cap = L.capture || {};
+  $("#jobCapNote").textContent = cap.state && cap.state !== "on" ? "Job capture is " + cap.state + "." : "";
+  $("#jobClear").hidden = !L.jobs.length;
+}
+async function loadJobs(){
+  let L; try { L = await api("/api/jobs"); } catch(e) { return; }
+  JV.list = L;
+  const ids = new Set(L.jobs.map(j => j.id).concat(L.live ? ["live"] : []));
+  if (JV.pinned && !ids.has(JV.pinned)) JV.pinned = null;
+  const want = JV.pinned || L.running || (L.live ? "live" : null) || (L.jobs[0] && L.jobs[0].id) || null;
+  try {
+    if (!want) { JV.parsed = null; }
+    else if (want === "live") {  // re-read while it grows, at most every 5 s
+      if (JV.shown !== "live" || (L.live.bytes !== JV.liveBytes && Date.now() - JV.liveAt > 5000)) {
+        JV.loading = JV.shown !== "live"; JV.liveBytes = L.live.bytes; JV.liveAt = Date.now();
+        JV.parsed = await jvFetch("live");
+      }
+    } else if (want !== JV.shown || !JV.parsed) {
+      JV.loading = true;
+      if (!JV.cache.has(want)) {
+        JV.cache.set(want, await jvFetch(want));
+        while (JV.cache.size > 3) JV.cache.delete(JV.cache.keys().next().value);
+      }
+      JV.parsed = JV.cache.get(want);
+    }
+  } catch(e) { JV.parsed = null; }
+  JV.loading = false; JV.shown = want;
+  jvList(); jvCaption(); jvDraw(); jvFrameButtons();
+}
+$("#jobList").addEventListener("click", e => {
+  const b = e.target.closest(".jobrow"); if (!b) return;
+  JV.pinned = b.dataset.id; loadJobs();
+});
+$("#jobFollow").addEventListener("click", () => { JV.pinned = null; loadJobs(); });
+function jvFrameButtons(){  // the Bridge re-checks all of this
+  const L = JV.list, id = JV.shown, c = JV.ctrl;
+  const meta = L && id && id !== "live" ? L.jobs.find(j => j.id === id) : null;
+  let why = "";
+  if (!meta) why = id === "live" ? "Wait until the job has been received" : "No job to frame";
+  else if (meta.absolute === false) why = "This job isn't placed with absolute coordinates (LightBurn: Start From \"Absolute Coords\"), so where it lands isn't known";
+  else if (!c || !c.available) why = "The laser isn't connected";
+  else if (c.state !== "idle" || c.motion) why = "Only while the laser is idle";
+  for (const b of [$("#jobFrame"), $("#jobFrameOutline")]) {
+    if (!b.dataset.tip) b.dataset.tip = b.title;  // the button's own tooltip, kept before replacing it
+    b.disabled = !!why || !!JV.framing;
+    b.title = why || b.dataset.tip;
+  }
+}
+async function jvFrame(kind){
+  JV.framing = true; jvFrameButtons();
+  try {
+    const r = await api("/api/laser/frame", {job: JV.shown, kind});
+    toast((kind === "box" ? "Frame" : "Outline frame") + " sent · about " + Math.max(1, Math.round(r.seconds)) + " s");
+  } catch(e) { notify("bad", "Frame failed", e.message, true); }
+  JV.framing = false; loadLaser();
+}
+$("#jobFrame").addEventListener("click", () => jvFrame("box"));
+$("#jobFrameOutline").addEventListener("click", () => jvFrame("outline"));
+$("#jobFlipX").addEventListener("click", () => { JV.flipX = !JV.flipX; localStorage.setItem("jvFlipX", JV.flipX ? "1" : "0"); jvDraw(); });
+$("#jobFlipY").addEventListener("click", () => { JV.flipY = !JV.flipY; localStorage.setItem("jvFlipY", JV.flipY ? "1" : "0"); jvDraw(); });
+$("#jobClear").addEventListener("click", async () => {
+  if (!confirm("Delete all captured jobs from the Bridge?")) return;
+  try { await api("/api/jobs/clear", {}); JV.cache.clear(); JV.pinned = null; toast("Job history cleared"); } catch(e) { toast(e.message, true); }
+  loadJobs();
+});
+window.addEventListener("resize", () => jvDraw());
+if (MONITOR) {
+  loadJobs();
+  setInterval(() => { if (!document.hidden) loadJobs(); }, 3000);
+}
+
+/* ---------- record laser traffic (diagnostics) ---------- */
+function recFormat(r){
+  const c = r.counts || {};
+  const head = `# lbcam ${$("#ver").textContent} laser traffic, ${r.packets.length} packets` +
+    ` (+ ${c.polls || 0} status polls, ${c.acks || 0} ACKs not listed${c.dropped ? ", " + c.dropped + " dropped" : ""})`;
+  const lines = r.packets.map(p => `${p.t.toFixed(3).padStart(8)}  ${p.dir === "out" ? "LB → laser" : "laser → LB"}  ${p.cmds.join(" | ")}${p.note ? "  (" + p.note + ")" : ""}`);
+  return [head].concat(lines.length ? lines : ["(nothing yet)"]).join("\n");
+}
+let recTimer = null;
+async function recPoll(){
+  let r; try { r = await api("/api/laser/record"); } catch(e) { $("#recState").textContent = e.message; return; }
+  if (r.started == null) { $("#recState").textContent = r.capture && r.capture !== "on" ? "Packet capture is " + r.capture : ""; return; }
+  $("#recText").hidden = false; $("#recCopy").hidden = false;
+  $("#recText").textContent = recFormat(r);
+  $("#recState").textContent = r.active ? "Recording… " + r.remaining + " s left" : "Done";
+  $("#recStart").disabled = r.active;
+  clearTimeout(recTimer);
+  if (r.active) recTimer = setTimeout(recPoll, 1000);
+}
+$("#recStart").addEventListener("click", async () => {
+  try { await api("/api/laser/record", {seconds: 30}); recPoll(); } catch(e) { toast(e.message, true); }
+});
+$("#recCopy").addEventListener("click", async () => {
+  try { await navigator.clipboard.writeText($("#recText").textContent); toast("Recording copied"); }
+  catch(e) { toast("Select the text and copy it manually", true); }
+});
+$("#recPanel").addEventListener("toggle", () => { if ($("#recPanel").open) recPoll(); });
 </script>
 </body>
 </html>

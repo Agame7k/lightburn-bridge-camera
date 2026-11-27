@@ -20,3 +20,4 @@ lbcam-update-*.tar.gz.sha256
 .idea/
 net_pending.json
 net_pending.json.tmp
+jobs/

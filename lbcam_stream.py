@@ -47,7 +47,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "2.18"
+VERSION = "3.1"
 LBCAM_HOME = os.environ.get("LBCAM_HOME", "/opt/lbcam")
 
 # ======================================================================== V4L2
@@ -487,6 +487,8 @@ class Config:
             "fps": int(os.environ.get("CAM_FPS", "15")),
             "controls": {},  # {camera id: {control id (str): value}}
             "update_auth": None,  # {"salt": hex, "hash": hex} - password for software updates
+            "flip_x": False,  # the machine's X runs right-to-left: mirror drawings, swap jog arrows
+            "flip_y": False,  # the machine's Y runs bottom-to-top
         }
         self.load_error = None
         self.save_error = None
@@ -495,7 +497,8 @@ class Config:
         try:
             with open(path) as f:
                 saved = json.load(f)
-            for k in ("device", "width", "height", "fps", "controls", "update_auth"):
+            for k in ("device", "width", "height", "fps", "controls", "update_auth",
+                      "flip_x", "flip_y"):
                 if k in saved:
                     self.data[k] = saved[k]
         except FileNotFoundError:
@@ -547,6 +550,8 @@ class Config:
     def public(self):
         with self.lock:
             d = {k: self.data[k] for k in ("device", "width", "height", "fps")}
+            d["flip_x"] = bool(self.data.get("flip_x"))
+            d["flip_y"] = bool(self.data.get("flip_y"))
         d["path"] = self.path
         d["load_error"] = self.load_error
         d["save_error"] = self.save_error
@@ -1234,9 +1239,12 @@ MEM = {  # address -> key (addresses are 14-bit: byte pair hi*128+lo)
     # The origin (Go to origin target). Two copies; after jogging away from the origin both
     # kept it while 0x0221/0x0231 followed the head. Verified on an RDC6442G.
     0x0224: "origin_x", 0x0234: "origin_y", 0x0229: "origin_x2", 0x0239: "origin_y2",
+    # Axis travel (bed size) from the per-axis settings blocks (X 0x0020.., Y 0x0030..): read
+    # 700000 / 500000 on a 700 x 500 mm machine. Jog and Move to never leave 0..travel.
+    0x0026: "bed_x", 0x0036: "bed_y",
 }
 MEM_FAST = (0x0200, 0x0221, 0x0231, 0x0241, 0x0251, 0x0320, 0x0321, 0x0203, 0x0208, 0x0211)
-MEM_SLOW = (0x0201, 0x0202, 0x0205, 0x02FE, 0x0224, 0x0234, 0x0229, 0x0239)
+MEM_SLOW = (0x0201, 0x0202, 0x0205, 0x02FE, 0x0224, 0x0234, 0x0229, 0x0239, 0x0026, 0x0036)
 # Status bits as seen on an RDC6442G: bit 0 = busy (job or manual move); during a job bit 9
 # (0x200) is clear and bit 1 means paused. Jogging sets bits 0 and 9 (and 1), and the job file
 # total reads FILE_TOTAL_UNKNOWN. (MeerK40t calls bit 1 "part end"; on hardware it is paused.)
@@ -1246,6 +1254,9 @@ MOVING_HOLD = 3.0  # s: show "moving" this long after the last position change
 # A job that has been running (not paused) this long without the laser-on counter moving is
 # probably blocked by an alarm. Water protection, for example, isn't readable from the controller.
 NOT_FIRING_AFTER = 20.0
+# Some controllers (an RDC6442G) don't update the laser-on counter while a job runs. So the warning
+# is only armed once the counter has been seen to tick during a job, and waits at least twice the
+# longest gap seen between ticks.
 # Control commands (MeerK40t's Ruida driver): sent on 50200 like everything else, answered with ACK.
 # name -> (bytes, states it is allowed in). Verified on an RDC6442G.
 # Deliberately NOT here: D8 2A ("Home XY" in MeerK40t) reset/rebooted an RDC6442G, and the
@@ -1395,10 +1406,24 @@ RuidaUDP.send = _ruida_send
 # Recorded from LightBurn on an RDC6442G: laser power set to 0 first, speed with C9 02, then
 # D9 10 00 <x> <y> rapid moves to absolute positions in µm (laser off).
 FRAME_SPEED = 100.0      # mm/s, what LightBurn used for framing and Go to origin
+# The controller keeps running D9 moves it already has after Stop (D8 01 is ACKed, the head goes
+# on). So moves are fed a few at a time while watching the head: Stop then ends within about
+# MOVES_AHEAD x MOVE_CHUNK.
+MOVE_CHUNK = 50000       # µm: longer moves are split into pieces this long
+MOVES_AHEAD = 2          # moves handed to the controller beyond the one the head has finished
+ARRIVED = 500            # µm: "at" a target
+JOG_SPEED_MAX = 300.0    # mm/s: jog / move-to speed limit
+BED_MIN, BED_MAX = 50000, 3000000  # µm: a travel outside this is a bad read, not a bed size
 MAX_COORD = 3000000      # µm: no laser bed is bigger than 3 m; anything beyond is garbage
 POWER_OFF_ORIGIN = (b"\xC6\x01\x00\x00", b"\xC6\x21\x00\x00")  # as LightBurn's Go to origin
 POWER_OFF_FRAME = (b"\xC6\x01\x00\x00", b"\xC6\x02\x00\x00", b"\xC6\x21\x00\x00", b"\xC6\x22\x00\x00")
 _RUIDA_TOKEN = re.compile(rb"[\x80-\xff][\x00-\x7f]*")
+
+
+# LightBurn's Home on an RDC6442G, recorded byte for byte: 100 mm/s, power 0, then one packet with
+# D0 29 89 89 (meaning unknown) and a rapid move to 0, 0. Sent exactly like this, never rebuilt.
+HOME_PACKETS = (bytes.fromhex("C9 02 00 00 06 0D 20"), bytes.fromhex("C6 01 00 00"), bytes.fromhex("C6 21 00 00"),
+                bytes.fromhex("D0 29 89 89 D9 10 00 00 00 00 00 00 00 00 00 00 00"))
 
 
 def ruida_speed(mm_s):
@@ -1412,8 +1437,46 @@ def ruida_rapid(x, y):
     return b"\xD9\x10\x00" + encode35(x) + encode35(y)
 
 
-def origin_packets(x, y):
-    return [ruida_speed(FRAME_SPEED)] + list(POWER_OFF_ORIGIN) + [ruida_rapid(x, y)]
+def chunked(start, points, chunk=MOVE_CHUNK):
+    """points with every segment (from start) longer than chunk split into equal pieces."""
+    out, prev = [], start
+    for p in points:
+        d = ((p[0] - prev[0]) ** 2 + (p[1] - prev[1]) ** 2) ** 0.5
+        n = max(1, int(-(-d // chunk)))
+        for k in range(1, n):
+            out.append((int(round(prev[0] + (p[0] - prev[0]) * k / n)), int(round(prev[1] + (p[1] - prev[1]) * k / n))))
+        out.append(p)
+        prev = p
+    return out
+
+
+def passed(head, targets):
+    """Index of the last target the head has reached or gone past along the path, else -1."""
+    hx, hy = head
+    best = -1
+    for k, (tx, ty) in enumerate(targets):
+        if abs(hx - tx) <= ARRIVED and abs(hy - ty) <= ARRIVED:
+            best = k
+        elif k + 1 < len(targets):  # on the way from this target to the next one
+            nx, ny = targets[k + 1]
+            dx, dy = nx - tx, ny - ty
+            L2 = dx * dx + dy * dy
+            if L2:
+                u = ((hx - tx) * dx + (hy - ty) * dy) / float(L2)
+                off = abs((hx - tx) * dy - (hy - ty) * dx) / L2 ** 0.5
+                if 0 < u < 1 and off <= ARRIVED:
+                    best = k
+    return best
+
+
+def _moves(start, points):
+    return [(ruida_rapid(*p), p) for p in chunked(start, points)]
+
+
+def origin_packets(x, y, start=None):
+    """[(packet, target or None)]; targets are waited for (paced) when sent."""
+    moves = _moves(start, [(x, y)]) if start else [(ruida_rapid(x, y), (x, y))]
+    return [(p, None) for p in [ruida_speed(FRAME_SPEED)] + list(POWER_OFF_ORIGIN)] + moves
 
 
 def frame_packets(points, back):
@@ -1421,8 +1484,9 @@ def frame_packets(points, back):
     pts = list(points)
     if pts[0] != pts[-1]:
         pts.append(pts[0])
-    return ([ruida_speed(0)] + list(POWER_OFF_FRAME) + [ruida_rapid(*pts[0]), ruida_speed(FRAME_SPEED)]
-            + [ruida_rapid(*p) for p in pts[1:]] + [ruida_speed(0), ruida_rapid(*back)])
+    setup = [(p, None) for p in [ruida_speed(0)] + list(POWER_OFF_FRAME)]
+    return (setup + _moves(back, pts[:1]) + [(ruida_speed(FRAME_SPEED), None)] + _moves(pts[0], pts[1:])
+            + [(ruida_speed(0), None)] + _moves(pts[-1], [back]))
 
 
 def path_seconds(points, speed=FRAME_SPEED):
@@ -1603,6 +1667,8 @@ class Ruida:
         self.on_run_end = None  # (run dict) -> None, called when a job run ends (JobCapture)
         self.motion = None  # {"name", "build", "who", "done", "error", "result"}: Go to origin / Frame
         self.motion_until = 0.0  # Stop is allowed until then (the head may still be moving)
+        self.laser_live, self.laser_gap = False, 0.0  # laser-on counter seen ticking during a job?
+        self.jog_target = None  # last jog's target (µm), so quick taps add up
         self.updated = None
         self.ns = None
 
@@ -1710,14 +1776,15 @@ class Ruida:
             self._do_command(transport)
 
     # ---- head moves (Go to origin, Frame): a list of packets, built in the worker from fresh reads
-    def move(self, name, build, who="?", timeout=30.0):
+    def move(self, name, build, who="?", timeout=30.0, jog=False):
         """build(transport, magic) -> (packets, seconds the move takes). Idle only. Raises
         RuidaCommandError with a reason; returns {"packets", "sent", "seconds"}."""
         with self.lock:
             available, state = self.state.get("available"), self.values.get("state")
         if not self.enabled or not available or self.magic is None:
             raise RuidaCommandError("the controller isn't connected")
-        if state != "idle":
+        own_move = jog and state == "moving" and time.time() < self.motion_until  # a jog still going
+        if state != "idle" and not own_move:
             raise RuidaCommandError("only while the laser is idle (it is %s)" % (state or "unknown"))
         job = {"name": name, "build": build, "who": who, "done": threading.Event(), "error": None, "result": None}
         with self.cmd_lock:
@@ -1736,6 +1803,8 @@ class Ruida:
 
     def _do_motion(self, t):
         job = self.motion
+        if job["name"] not in ("jog", "move to"):
+            self.jog_target = None
         packets, seconds, sent = [], 0.0, 0
         with self.cmd_lock:
             job["started"] = True
@@ -1749,7 +1818,13 @@ class Ruida:
                 job["error"] = str(e)
         if packets:
             self.motion_until = time.time() + 10 + seconds  # Stop stays allowed while it moves
-        for i, pkt in enumerate(packets):
+        pending = []  # targets of moves handed to the controller and not reached yet
+        for i, (pkt, target) in enumerate(packets):
+            if target is not None:
+                err = self._wait_for_room(t, pending)
+                if err:
+                    job["error"] = err % (i, len(packets))
+                    break
             if self.cmd and not self.cmd["sent"]:  # Stop (or Pause) arrived: don't send the rest
                 job["error"] = "interrupted by %s after %d of %d parts" % (self.cmd["name"], i, len(packets))
                 self._do_command(t)
@@ -1765,6 +1840,8 @@ class Ruida:
                                 % (i + 1, len(packets), res or "no answer"))
                 break
             sent += 1
+            if target is not None:
+                pending.append(target)
         job["result"] = {"packets": len(packets), "sent": sent, "seconds": round(seconds, 1)}
         log("laser %s from %s: %d/%d parts sent%s" % (job["name"], job["who"], sent, len(packets),
                                                       " - " + job["error"] if job["error"] else ""))
@@ -1772,6 +1849,30 @@ class Ruida:
             self.motion = None
         job["done"].set()
         self.want()
+
+    def _wait_for_room(self, t, pending):
+        """Wait until at most MOVES_AHEAD - 1 sent moves are unfinished, watching the head.
+        Returns None, or an error format (with %d of %d) if Stop arrived or the head is stuck."""
+        last, last_change = None, time.time()
+        while len(pending) >= MOVES_AHEAD:
+            if self.cmd and not self.cmd["sent"]:
+                name = self.cmd["name"]
+                self._do_command(t)
+                return "interrupted by " + name + " after %d of %d parts"
+            x, y = t.read(0x0221, self.magic), t.read(0x0231, self.magic)
+            if x is not None and y is not None:
+                with self.lock:  # keep the dashboard's head marker moving
+                    self.raw["x"], self.raw["y"] = x, y
+                if (x, y) != last:
+                    last, last_change = (x, y), time.time()
+                k = passed((x, y), pending)
+                if k >= 0:  # polls can miss the head at a target, so also count it as passed
+                    del pending[:k + 1]  # once the head is at a later one or on the way there
+                    continue
+            if time.time() - last_change > 5:  # not moving and not there
+                return "the head stopped short of the frame after %d of %d parts - check the machine"
+            time.sleep(0.03)
+        return None
 
     @staticmethod
     def _read_all(t, magic, addrs):
@@ -1786,8 +1887,47 @@ class Ruida:
             if (ox, oy) != (ox2, oy2):
                 raise RuidaCommandError("the controller's two origin values disagree (%.1f, %.1f vs %.1f, %.1f mm)"
                                         " - not moving" % (ox / 1000.0, oy / 1000.0, ox2 / 1000.0, oy2 / 1000.0))
-            return origin_packets(ox, oy), path_seconds([(cx, cy), (ox, oy)])
+            return origin_packets(ox, oy, (cx, cy)), path_seconds([(cx, cy), (ox, oy)])
         return self.move("go to origin", build, who)
+
+    def _bed(self, t, magic):
+        bx, by = self._read_all(t, magic, (0x0026, 0x0036))
+        if not (BED_MIN <= bx <= BED_MAX and BED_MIN <= by <= BED_MAX):
+            raise RuidaCommandError("couldn't read a sensible bed size from the controller (%s x %s)" % (bx, by))
+        return bx, by
+
+    def jog(self, dx=0.0, dy=0.0, x=None, y=None, speed=FRAME_SPEED, who="?"):
+        """Laser-off move by (dx, dy) mm, or to (x, y) mm when given. Jogs stop at the bed's edge;
+        a move-to outside the bed is refused. Repeated jogs while one is still moving stack up."""
+        speed = max(1.0, min(float(speed), JOG_SPEED_MAX))
+        absolute = x is not None or y is not None
+
+        def build(t, magic):
+            bx, by = self._bed(t, magic)
+            cx, cy = self._read_all(t, magic, (0x0221, 0x0231))
+            # stack on the previous jog's target while that move is still going
+            base = self.jog_target if (self.jog_target and time.time() < self.motion_until) else (cx, cy)
+            if absolute:
+                tx = int(round(float(x if x is not None else base[0] / 1000.0) * 1000))
+                ty = int(round(float(y if y is not None else base[1] / 1000.0) * 1000))
+                if not (0 <= tx <= bx and 0 <= ty <= by):
+                    raise RuidaCommandError("%.1f, %.1f mm is outside the bed (0-%.0f x 0-%.0f mm)"
+                                            % (tx / 1000.0, ty / 1000.0, bx / 1000.0, by / 1000.0))
+            else:
+                tx = min(max(int(round(base[0] + float(dx) * 1000)), 0), bx)
+                ty = min(max(int(round(base[1] + float(dy) * 1000)), 0), by)
+                if (tx, ty) == tuple(base):
+                    raise RuidaCommandError("already at the edge of the bed")
+            self.jog_target = (tx, ty)
+            setup = [(p, None) for p in [ruida_speed(speed)] + list(POWER_OFF_ORIGIN)]
+            return setup + _moves(base, [(tx, ty)]), path_seconds([base, (tx, ty)], speed)
+        return self.move("move to" if absolute else "jog", build, who, jog=True)
+
+    def home(self, who="?"):
+        def build(t, magic):
+            cx, cy = self._read_all(t, magic, (0x0221, 0x0231))
+            return [(p, None) for p in HOME_PACKETS], path_seconds([(cx, cy), (0, 0)])
+        return self.move("home", build, who)
 
     def frame(self, outline, who="?", label="frame"):
         """Trace outline (µm points) and return to where the head was."""
@@ -1935,7 +2075,8 @@ class Ruida:
             if running:
                 if not self.job:
                     self.job = {"start": now, "count0": count, "progress": None,
-                                "laser0": lt, "run_s": 0.0, "tick": now, "fired": False}
+                                "laser0": lt, "run_s": 0.0, "tick": now, "fired": False, "lt_last": lt,
+                                "lt_at": None}
                 job = self.job
                 if progress is not None:
                     job["progress"] = progress
@@ -1943,9 +2084,14 @@ class Ruida:
                     job["run_s"] += now - job["tick"]
                 job["tick"] = now
                 if job["laser0"] is None:
-                    job["laser0"] = lt
+                    job["laser0"] = job["lt_last"] = lt
                 elif lt is not None and lt > job["laser0"]:
                     job["fired"] = True
+                if lt is not None and job["lt_last"] is not None and lt > job["lt_last"]:
+                    if job["lt_at"] is not None:  # gap between two ticks while running
+                        self.laser_gap = max(self.laser_gap, job["run_s"] - job["lt_at"])
+                    job["lt_at"], job["lt_last"] = job["run_s"], lt
+                    self.laser_live = True  # this controller updates the counter during jobs
             elif self.job:
                 self._job_ended(self.job, now, count)
                 self.job = None
@@ -1960,8 +2106,9 @@ class Ruida:
                     log("job history: %s" % e)
         v["elapsed"] = round(now - self.job["start"]) if self.job else None
         j = self.job
-        v["not_firing"] = bool(j and not j["fired"] and j["laser0"] is not None
-                               and j["run_s"] >= NOT_FIRING_AFTER)
+        v["not_firing"] = bool(j and self.laser_live and not j["fired"] and j["laser0"] is not None
+                               and j["run_s"] >= max(NOT_FIRING_AFTER, 2 * self.laser_gap))
+        v["laser_counter_live"] = self.laser_live
         if v["not_firing"] and not j.get("warned"):
             j["warned"] = True
             log("laser job has run %ds without firing - alarm on the panel?" % j["run_s"])
@@ -1970,6 +2117,8 @@ class Ruida:
         if r.get("origin_x") is not None and (r.get("origin_x"), r.get("origin_y")) == (r.get("origin_x2"), r.get("origin_y2")):
             v["origin"] = {"x": round(r["origin_x"] / 1000.0, 2), "y": round(r["origin_y"] / 1000.0, 2)}
         v["motion"] = self.motion_busy()
+        if r.get("bed_x") and BED_MIN <= r["bed_x"] <= BED_MAX and BED_MIN <= (r.get("bed_y") or 0) <= BED_MAX:
+            v["bed"] = {"x": round(r["bed_x"] / 1000.0, 1), "y": round(r["bed_y"] / 1000.0, 1)}
         # U often reads a fixed value on machines without a rotary: show it once it has moved
         if "u" in r:
             self.first_u = r["u"] if self.first_u is None else self.first_u
@@ -2911,7 +3060,7 @@ def make_handler(cam, cfg, dashboard, updater, net=None, laser=None, ruida=None,
                 return self._send(403, "text/plain", err.encode(), head)
             u = urlparse(self.path)
             p = u.path.rstrip("/") or "/"
-            if p in ("/", "/index.html", "/monitor"):  # one page, two views
+            if p in ("/", "/index.html", "/monitor", "/control"):  # one page, three views
                 return self._send(200, "text/html; charset=utf-8", dashboard, head)
             if p in ("/stream", "/stream.mjpg", "/video", "/mjpeg"):
                 if head:
@@ -3007,13 +3156,20 @@ def make_handler(cam, cfg, dashboard, updater, net=None, laser=None, ruida=None,
                     except RuidaCommandError as e:
                         return self._json({"error": "Couldn't %s: %s" % (name, e)}, 409)
                     return self._json({"ok": True, "cmd": name})
-                if p in ("/api/laser/origin", "/api/laser/frame"):
+                if p in ("/api/laser/origin", "/api/laser/frame", "/api/laser/home", "/api/laser/jog"):
                     if not ruida:
                         return self._json({"error": "laser control isn't available"}, 409)
                     who = self.client_address[0]
                     try:
                         if p == "/api/laser/origin":
                             return self._json(dict(ok=True, **ruida.go_to_origin(who=who)))
+                        if p == "/api/laser/home":
+                            return self._json(dict(ok=True, **ruida.home(who=who)))
+                        if p == "/api/laser/jog":  # {"dx","dy"} or {"x","y"} in mm, optional "speed" mm/s
+                            num = lambda k: None if body.get(k) is None else float(body[k])
+                            return self._json(dict(ok=True, **ruida.jog(
+                                dx=num("dx") or 0.0, dy=num("dy") or 0.0, x=num("x"), y=num("y"),
+                                speed=num("speed") or FRAME_SPEED, who=who)))
                         kind = str(body.get("kind") or "box")
                         data = jobs.store.read(str(body.get("job") or "")) if jobs else None
                         if data is None:
@@ -3022,7 +3178,8 @@ def make_handler(cam, cfg, dashboard, updater, net=None, laser=None, ruida=None,
                         return self._json(dict(ok=True, points=len(outline),
                                                **ruida.frame(outline, who=who, label=kind + " frame")))
                     except RuidaCommandError as e:
-                        what = "go to origin" if p == "/api/laser/origin" else "frame"
+                        what = {"/api/laser/origin": "go to origin", "/api/laser/home": "home",
+                                "/api/laser/jog": "move"}.get(p, "frame")
                         return self._json({"error": "Couldn't %s: %s" % (what, e)}, 409)
                 if p == "/api/laser/scan":  # POST, so the X-LBCam/Origin checks apply
                     if not ruida:
@@ -3067,8 +3224,14 @@ def make_handler(cam, cfg, dashboard, updater, net=None, laser=None, ruida=None,
                             if not (1 <= v <= 10000):
                                 raise ValueError("%s out of range" % k)
                             upd[k] = v
+                    for k in ("flip_x", "flip_y"):
+                        if k in body:
+                            if not isinstance(body[k], bool):
+                                raise ValueError("%s must be true or false" % k)
+                            upd[k] = body[k]
                     cfg.update(**upd)
-                    cam.reopen.set()
+                    if set(upd) - {"flip_x", "flip_y"}:
+                        cam.reopen.set()  # only camera settings need the camera reopened
                     return self._json({"ok": True, "config": cfg.public()})
                 if p == "/api/control":
                     actual = cam.set_control(int(body["id"]), int(body["value"]))

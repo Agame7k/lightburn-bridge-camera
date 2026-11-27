@@ -21,6 +21,8 @@ class FakeRuida:
         self.commands = []
         self.silent_commands = False
         self.ack_delay = 0.0  # s before answering a command (a slow controller)
+        self.move_time = 0.0  # s each D9 move takes; moves queue up like on the controller
+        self.queue = []       # (done_at, x, y)
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.bind(("127.0.0.1", 0))
         self.port = self.sock.getsockname()[1]
@@ -50,7 +52,7 @@ class FakeRuida:
         self.requests.append(d)
         if self.silent_commands and d[:1] in (b"\xD8", b"\xA5"):
             return
-        cmd = d[:1] in (b"\xD8", b"\xA5", b"\xD9", b"\xC9", b"\xC6")
+        cmd = d[:1] in (b"\xD8", b"\xA5", b"\xD9", b"\xC9", b"\xC6", b"\xD0")
         if self.ack_delay and cmd:
             time.sleep(self.ack_delay)
         self.sock.sendto(app.ruida_swizzle(b"\xCC", self.magic), src)  # ACK first, like the real one
@@ -61,6 +63,11 @@ class FakeRuida:
             self.mem[0x0200] = 0x10401
         elif d == b"\xD8\x01":
             self.mem[0x0200] = 0x10600
+        if d[:1] == b"\xD9" and len(d) == 13:
+            start = max(time.time(), self.queue[-1][0] if self.queue else 0)
+            self.queue.append((start + self.move_time, app.decode35(d[3:8]), app.decode35(d[8:13])))
+        while self.queue and self.queue[0][0] <= time.time():  # the head got there
+            _, self.mem[0x0221], self.mem[0x0231] = self.queue.pop(0)
         if d[:2] == b"\xDA\x00" and len(d) == 4:
             addr = (d[2] << 7) | d[3]
             if addr in self.mem:
@@ -168,6 +175,7 @@ class ReaderTest(unittest.TestCase):
 
     def test_not_firing_warning(self):
         # recorded with Water Prot1 active: running, progress 0, laser-on time frozen
+        self.r.laser_live = True  # this controller's counter is known to tick during jobs
         self.r.poll_once(self.t)
         self.run_job([(0x10401, 0, None)])
         self.assertFalse(self.r.status()["not_firing"])
@@ -177,6 +185,36 @@ class ReaderTest(unittest.TestCase):
         self.ctrl.mem[0x0211] += 1  # the laser fires after all
         self.run_job([(0x10401, 10, None)])
         self.assertFalse(self.r.status()["not_firing"])
+
+    def test_no_warning_while_counter_not_known_to_tick(self):
+        # An RDC6442G didn't update the laser-on counter during a 388 s job that was cutting:
+        # without having seen it tick during a job, never warn.
+        self.r.poll_once(self.t)
+        self.run_job([(0x10401, 0, None)])
+        self.r.job["run_s"] = 300
+        self.run_job([(0x10401, 50, None)])
+        self.assertFalse(self.r.status()["not_firing"])
+        self.assertFalse(self.r.status()["laser_counter_live"])
+
+    def test_counter_ticks_arm_warning_and_set_wait(self):
+        self.r.poll_once(self.t)
+        self.run_job([(0x10401, 0, None)])
+        self.r.job["run_s"] = 5
+        self.ctrl.mem[0x0211] += 1
+        self.run_job([(0x10401, 10, None)])
+        self.r.job["run_s"] = 35  # next tick 30 s later: the counter steps slowly
+        self.ctrl.mem[0x0211] += 1
+        self.run_job([(0x10401, 20, None)])
+        self.assertTrue(self.r.laser_live)
+        self.assertGreaterEqual(self.r.laser_gap, 29)
+        self.run_job([(0x10600, 100, None)])  # done; a new job that doesn't fire
+        self.run_job([(0x10401, 0, None)])
+        self.r.job["run_s"] = 40  # past 20 s but not past 2 x 30 s
+        self.run_job([(0x10401, 0, None)])
+        self.assertFalse(self.r.status()["not_firing"])
+        self.r.job["run_s"] = 61
+        self.run_job([(0x10401, 0, None)])
+        self.assertTrue(self.r.status()["not_firing"])
 
     def test_paused_time_does_not_count_as_not_firing(self):
         self.r.poll_once(self.t)
@@ -257,7 +295,11 @@ class CommandTest(unittest.TestCase):
 
     def setUp(self):
         self.ctrl = FakeRuida(magic=0x88, mem={0x02FE: 0x65006500, 0x0200: 0x10600, 0x0221: 0, 0x0231: 0,
-                                               0x0241: 0, 0x0251: 0, 0x0320: 1909, 0x0321: 0, 0x0203: 5, 0x0208: 0})
+                                               0x0241: 0, 0x0251: 0, 0x0320: 1909, 0x0321: 0, 0x0203: 5, 0x0208: 0,
+                                               # answered like a real controller, so the slow poll is quick
+                                               0x0201: 0, 0x0202: 0, 0x0205: 0, 0x0211: 0,
+                                               0x0224: 0, 0x0234: 0, 0x0229: 0, 0x0239: 0,
+                                               0x0026: 700000, 0x0036: 500000})
         self.r = app.Ruida(FakeLaser(), enabled=True,
                            transport_factory=lambda ip: app.RuidaUDP(ip, bind=("127.0.0.1", 0), port=self.ctrl.port))
         self.r.start()
@@ -349,7 +391,8 @@ class UnsentCommandTest(unittest.TestCase):
         self.assertIsNone(r.cmd)  # withdrawn: a late worker won't send it
 
 
-ORIGIN = {0x0224: 276113, 0x0234: 435380, 0x0229: 276113, 0x0239: 435380}
+ORIGIN = {0x0224: 276113, 0x0234: 435380, 0x0229: 276113, 0x0239: 435380,
+          0x0026: 700000, 0x0036: 500000}  # and the bed size (axis travel), as read on a 700 x 500 machine
 
 
 class MotionTest(CommandTest):
@@ -362,11 +405,21 @@ class MotionTest(CommandTest):
 
     def test_go_to_origin_matches_lightburn(self):
         r = self.r.go_to_origin(who="test")
-        self.assertEqual(self.ctrl.commands, [
+        c = self.ctrl.commands
+        self.assertEqual(c[:3], [
             bytes.fromhex("C9 02 00 00 06 0D 20"),           # 100 mm/s
-            bytes.fromhex("C6 01 00 00"), bytes.fromhex("C6 21 00 00"),
-            bytes.fromhex("D9 10 00 00 00 10 6D 11 00 00 1A 49 34")])  # exactly LightBurn's bytes
-        self.assertEqual((r["packets"], r["sent"]), (4, 4))
+            bytes.fromhex("C6 01 00 00"), bytes.fromhex("C6 21 00 00")])
+        self.assertEqual(c[-1], bytes.fromhex("D9 10 00 00 00 10 6D 11 00 00 1A 49 34"))  # LightBurn's move
+        steps = c[3:]  # ~281 mm in 50 mm pieces, all on the straight line from the head
+        self.assertEqual(len(steps), 6)
+        self.assertTrue(all(s[:3] == b"\xD9\x10\x00" for s in steps))
+        self.assertEqual(r["sent"], r["packets"])
+
+    def test_home_is_lightburns_bytes(self):
+        self.r.home(who="test")
+        self.assertEqual([c.hex(" ").upper() for c in self.ctrl.commands], [
+            "C9 02 00 00 06 0D 20", "C6 01 00 00", "C6 21 00 00",
+            "D0 29 89 89 D9 10 00 00 00 00 00 00 00 00 00 00 00"])  # one packet, as recorded
 
     def test_origin_copies_must_agree(self):
         self.ctrl.mem[0x0229] = 0
@@ -398,17 +451,38 @@ class MotionTest(CommandTest):
         box = [(306000, 40000), (306000, 332000), (626000, 332000), (626000, 40000), (306000, 40000)]
         self.r.frame(box)
         hx = lambda b: b.hex(" ").upper()
-        self.assertEqual([hx(c) for c in self.ctrl.commands], [
-            "C9 02 00 00 00 00 00", "C6 01 00 00", "C6 02 00 00", "C6 21 00 00", "C6 22 00 00",
-            "D9 10 00 00 00 12 56 50 00 00 02 38 40", "C9 02 00 00 06 0D 20",
-            "D9 10 00 00 00 12 56 50 00 00 14 21 60", "D9 10 00 00 00 26 1A 50 00 00 14 21 60",
-            "D9 10 00 00 00 26 1A 50 00 00 02 38 40", "D9 10 00 00 00 12 56 50 00 00 02 38 40",
-            "C9 02 00 00 00 00 00",
-            hx(app.ruida_rapid(148845, 186540))])  # back to where the head was
+        c = [hx(x) for x in self.ctrl.commands]
+        self.assertEqual(c[:5], ["C9 02 00 00 00 00 00", "C6 01 00 00", "C6 02 00 00", "C6 21 00 00", "C6 22 00 00"])
+        self.assertIn("C9 02 00 00 06 0D 20", c)  # 100 mm/s for the frame itself
+        last_speed = len(c) - 1 - c[::-1].index("C9 02 00 00 00 00 00")
+        self.assertTrue(all(x.startswith("D9 10 00") for x in c[last_speed + 1:]))
+        self.assertEqual(c[-1], hx(app.ruida_rapid(148845, 186540)))  # back to where the head was
+        targets = [(app.decode35(x[3:8]), app.decode35(x[8:13])) for x in self.ctrl.commands if x[:1] == b"\xD9"]
+        corners = [t for t in targets if t in box]  # LightBurn's corners, in LightBurn's order
+        self.assertEqual(corners[:5], box)
+        frame_part = targets[targets.index(box[0]):len(targets) - 0]
+        for a_, b_ in zip(frame_part, frame_part[1:]):  # no piece longer than MOVE_CHUNK
+            self.assertLessEqual(((a_[0] - b_[0]) ** 2 + (a_[1] - b_[1]) ** 2) ** 0.5, app.MOVE_CHUNK + 1)
+
+    def test_moves_are_paced(self):
+        # The controller keeps running moves it already has, so never hand it more than a few.
+        self.ctrl.move_time = 0.15
+        outline = [(150000 + i * 2000, 190000 + (i % 2) * 3000) for i in range(12)]  # zigzag
+        ahead = []
+        orig = self.ctrl.handle
+
+        def spy(data, src):
+            orig(data, src)
+            d = app.ruida_unswizzle(data[2:], self.ctrl.magic)
+            if d[:1] == b"\xD9":
+                ahead.append(len(self.ctrl.queue))
+        self.ctrl.handle = spy
+        self.r.frame(outline)
+        self.assertLessEqual(max(ahead), app.MOVES_AHEAD)
 
     def test_stop_interrupts_a_frame(self):
-        self.ctrl.ack_delay = 0.05
-        outline = [(100000 + i * 100, 100000) for i in range(200)]
+        self.ctrl.move_time = 0.1
+        outline = [(100000 + i * 1000, 100000 + (i % 2) * 2000) for i in range(60)]
         res = {}
 
         def run():
@@ -423,7 +497,10 @@ class MotionTest(CommandTest):
         t.join(20)
         self.assertRegex(res.get("err", ""), "(interrupted|cancelled) by stop")  # depends on timing
         self.assertIn(b"\xD8\x01", self.ctrl.commands)
-        self.assertLess(sum(1 for c in self.ctrl.commands if c[:1] == b"\xD9"), 100)
+        d9 = [i for i, c in enumerate(self.ctrl.commands) if c[:1] == b"\xD9"]
+        stop = self.ctrl.commands.index(b"\xD8\x01")
+        self.assertLess(len(d9), 20)  # stopped early, not all 60+ moves
+        self.assertTrue(all(i < stop for i in d9))  # and nothing was sent after the Stop
 
     def test_stop_cancels_a_queued_frame(self):
         # Stop before the worker started the frame: the frame must not run after the Stop.
@@ -437,6 +514,54 @@ class MotionTest(CommandTest):
         r._do_motion(None)  # what the worker does next: builds and sends nothing
         self.assertEqual(job["error"], "cancelled by stop before it started")
         self.assertEqual(job["result"]["sent"], 0)
+
+    def d9_targets(self):
+        return [(app.decode35(c[3:8]), app.decode35(c[8:13])) for c in self.ctrl.commands if c[:1] == b"\xD9"]
+
+    def test_jog_relative_laser_off(self):
+        self.r.jog(dx=10, dy=-5, speed=50)
+        c = self.ctrl.commands
+        self.assertEqual(c[:3], [app.ruida_speed(50), bytes.fromhex("C6 01 00 00"), bytes.fromhex("C6 21 00 00")])
+        self.assertEqual(self.d9_targets(), [(158845, 181540)])
+
+    def test_jog_stops_at_the_bed_edge(self):
+        self.r.jog(dx=-1000, dy=1000)  # far past both edges
+        self.assertEqual(self.d9_targets()[-1], (0, 500000))
+        self.ctrl.commands.clear()
+        with self.assertRaises(app.RuidaCommandError) as cm:
+            self.r.jog(dx=-10)  # already at X 0
+        self.assertIn("edge", str(cm.exception))
+        self.assertEqual(self.ctrl.commands, [])
+
+    def test_move_to_inside_bed_only(self):
+        self.r.jog(x=300, y=100)
+        self.assertEqual(self.d9_targets()[-1], (300000, 100000))
+        self.ctrl.commands.clear()
+        for x, y in ((701, 10), (10, -1)):
+            with self.assertRaises(app.RuidaCommandError) as cm:
+                self.r.jog(x=x, y=y)
+            self.assertIn("outside the bed", str(cm.exception))
+        self.assertEqual(self.ctrl.commands, [])
+
+    def test_jog_needs_a_sensible_bed_size(self):
+        self.ctrl.mem[0x0026] = 0
+        with self.assertRaises(app.RuidaCommandError) as cm:
+            self.r.jog(dx=1)
+        self.assertIn("bed size", str(cm.exception))
+
+    def test_quick_jogs_add_up(self):
+        self.ctrl.move_time = 0.5  # the first jog is still moving when the second comes
+        self.r.jog(dx=10)
+        self.r.want()
+        self.wait_for(lambda s: s["state"] == "moving" or s.get("motion"))
+        with self.r.lock:  # the status reader sees the head moving
+            self.r.values["state"] = "moving"
+        self.r.jog(dx=10)
+        self.assertEqual(self.d9_targets()[-1], (168845, 186540))  # 20 mm from the start, not 10 from mid-move
+
+    def test_speed_limited(self):
+        self.r.jog(dx=1, speed=5000)
+        self.assertEqual(self.ctrl.commands[0], app.ruida_speed(app.JOG_SPEED_MAX))
 
     def test_stop_still_refused_when_nothing_moves(self):
         with self.assertRaises(app.RuidaCommandError):
@@ -471,6 +596,8 @@ class ScanTest(CommandTest):
 
 
     def test_scan_reads_range_only_answered(self):
+        for a in (0x0201, 0x0202):  # two addresses that don't answer
+            del self.ctrl.mem[a]
         r = self.r.scan(0x0200, 4)
         self.assertEqual(r["values"], {"0x0200": 0x10600, "0x0203": 5})  # 0x201/0x202 don't answer
         self.assertEqual((r["count"], r["answered"], r["missing"]), (4, 2, 2))

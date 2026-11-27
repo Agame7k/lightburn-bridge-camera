@@ -23,7 +23,7 @@ USB camera ─▶ LightBurn Bridge (lbcam, port 8080) ─WiFi─▶ LightBurn "n
   - Bridge health: CPU temperature, under-voltage/throttling, load
   - laser buttons: **Pause / Resume / Stop** during a job (Resume asks for confirmation, and for
     the update password when one is set, because it makes the laser fire again)
-  - **Go to origin** and **Frame** / **Outline frame** while the laser is idle: the same laser-off
+  - **Home**, **Go to origin** and **Frame** / **Outline frame** while the laser is idle: the same laser-off
     moves LightBurn sends, built on the Bridge. Stop also cancels a frame or move.
   - **"Laser isn't firing" warning** when a job has run 20 s without the laser-on counter
     moving: usually an alarm on the panel such as Water Prot (the water alarm itself can't be
@@ -36,6 +36,14 @@ USB camera ─▶ LightBurn Bridge (lbcam, port 8080) ─WiFi─▶ LightBurn "n
   stopped at N%, laser disconnected / connected, camera unplugged / plugged in, Bridge hot or
   under-voltage. Important ones stay until dismissed; a hidden tab shows a count in its title.
   Optional sound (bell button in the header).
+- **Control page** at `http://<bridge-ip>:8080/control`, made for a phone next to the laser:
+  - big status (Idle / Running / Paused / Moving), progress, head X/Y and the bed size
+  - jog pad with diagonals, distance (0.1 / 1 / 10 / 50 / 100 mm or any value) and speed,
+    like LightBurn's Move window; **Move to** X/Y; **Home** and **Go to origin**
+  - the job drawing with **Frame** / **Outline frame**, and recent jobs
+  - **Stop** and **Pause / Resume** always at the bottom of the screen
+  - every move is laser-off, limited to the bed (read from the controller), and can be stopped;
+    optional camera; can be added to the phone's home screen
 - **Setup page** at `http://<bridge-ip>:8080/`:
   - live preview, status, measured fps, viewer count
   - camera picker, resolution and frame rate dropdowns showing what the camera actually supports
@@ -111,6 +119,8 @@ laser's Ethernet link isn't touched.
   goes back to DHCP.
 
 ## Updating
+
+What changed in each version: [CHANGELOG.md](CHANGELOG.md).
 
 1. Change the code and bump `VERSION` in `lbcam_stream.py`.
 2. `python3 make_update.py` → `lbcam-update-<version>.tar.gz` plus
@@ -189,6 +199,8 @@ sudo journalctl -u lbcam -f
 | `GET /api/laser/record` | the recording: packets with time, direction and commands; status polls and ACKs only counted |
 | `GET /api/health` | Bridge CPU temperature, power/throttling flags, load, uptime |
 | `POST /api/laser/scan` | `{"start": "0x200", "count": 256}`. Diagnostic: reads a range of controller memory (idle only, read-only, at most 512 addresses; stops early if the laser gets busy) |
+| `POST /api/laser/home` | LightBurn's Home, byte for byte (laser off, head to 0, 0; idle only) |
+| `POST /api/laser/jog` | `{"dx","dy"}` (relative) or `{"x","y"}` (absolute) in mm, optional `"speed"` mm/s (1–300): laser-off move inside the bed; jogs stop at the edge |
 | `POST /api/laser/origin` | move the head to the origin stored in the controller (laser off; idle only) |
 | `POST /api/laser/frame` | `{"job": "<id>", "kind": "box" \| "outline"}`: trace a captured job's bounding box or outline (laser off; idle only; absolute-placed jobs only), then return |
 | `POST /api/laser/command` | `{"cmd": "pause" \| "resume" \| "stop"}`. `resume` also needs `"password"` when the update password is set |
@@ -297,6 +309,11 @@ copies disagree. A frame is the same moves around the outline, at 100 mm/s with 
 settings at 0. `D8 01` (Stop) cancels a frame that is still being sent. MeerK40t's "Home XY"
 (`D8 2A`) is deliberately not used: it reset this controller.
 
+The bed size comes from the axis settings: X travel at `0x0026` and Y travel at `0x0036` (read
+700000 / 500000 µm on a 700 × 500 mm machine). Jog and Move to are the same laser-off `D9` moves
+at the chosen speed (`C9 02`), never outside 0 to travel; Home is LightBurn's recorded bytes,
+sent as-is.
+
 ### Job capture
 
 LightBurn's relay sends each job to the controller over the Bridge's Ethernet port. lbcam
@@ -309,8 +326,9 @@ data). Streams without a single cut (framing, jogging) aren't kept.
   as plain Ruida bytes. The dashboard decodes and draws them; the Bridge doesn't.
 - A run is matched to the job captured up to 10 minutes before it started. Jobs started from
   files stored on the laser's panel can't be shown unless they were sent while lbcam was running.
-- The drawing's done part comes from the controller's progress, so it's approximate. Use
-  **Mirror** / **Flip** once to match your machine's origin (remembered per browser).
+- The drawing's done part comes from the controller's progress, so it's approximate. If it's
+  mirrored compared to the bed, or the jog arrows go the wrong way, turn on **Flip X** / **Flip Y**
+  under *Machine direction* on the Setup page (saved on the Bridge, for every device).
 - Turn it off with `LBCAM_JOBS=0` in `/boot/lbcam.env`.
 - **Frame** and **Outline frame** trace the shown job's bounding box or the outline around its
   cuts (its convex hull, like LightBurn's rubber-band frame) at 100 mm/s with laser power set

@@ -2,7 +2,11 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Laser">
+<meta name="theme-color" content="#1d2024">
 <title>Bridge Camera</title>
 <style>
 :root{
@@ -120,12 +124,40 @@ details.panel[open] summary h2::after{content:" ▾"}
 .jobrow.on{border-color:var(--accent)}
 a.button{font:inherit;padding:8px 12px;border-radius:7px;border:1px solid var(--line);background:var(--field);color:var(--text);text-decoration:none}
 .rec{margin:10px 0 0;max-height:340px;overflow:auto;background:var(--field);border:1px solid var(--line);border-radius:7px;padding:10px;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap}
+/* ---------- control page: phone first ---------- */
+.control{padding-bottom:calc(96px + env(safe-area-inset-bottom))}
+.control button,.control input{touch-action:manipulation}
+.cstat .jobstate{font-size:34px}
+.cpos{display:flex;gap:16px;flex-wrap:wrap;margin-top:10px;font-size:17px;font-variant-numeric:tabular-nums}
+.cpos b{font-weight:650}
+.cmeta{color:var(--muted);font-size:13px;align-self:center}
+.jogpad{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;max-width:340px;margin:0 auto}
+.jogpad button,.jogpad #cOrigin{min-height:64px;font-size:26px;padding:0;border-radius:12px}
+.jogpad #cOrigin{font-size:15px;font-weight:600}
+.chips{display:flex;flex-wrap:wrap;gap:6px}
+.chips button{min-width:52px;min-height:44px;font-weight:600}
+.chips button.on{border-color:var(--accent);color:var(--accent)}
+.chips input{flex:1 1 90px;min-width:90px;min-height:44px}
+.control input[type=number]{width:100%;min-height:44px;padding:8px 10px;border:1px solid var(--line);border-radius:7px;background:var(--field);color:var(--text);font:inherit;font-size:16px}
+.moveto{display:grid;grid-template-columns:1fr 1fr auto;gap:8px}
+.moveto button{min-height:44px;min-width:64px;font-weight:600}
+.cbtns{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:14px}
+.cbtns button{min-height:52px;font-weight:600}
+.cbtns button[hidden]{display:none}
+.cbtns button:only-child{grid-column:1/-1}
+@media (max-width:480px){#pill{display:none} .tabs a{padding:4px 8px} header{gap:6px}}
+.cbar{position:fixed;left:0;right:0;bottom:0;z-index:4;display:flex;gap:10px;padding:10px 16px calc(10px + env(safe-area-inset-bottom));background:var(--panel);border-top:1px solid var(--line);box-shadow:0 -4px 16px rgba(0,0,0,.12)}
+.cbar button{flex:1 1 0;min-height:60px;font-size:18px;font-weight:700;border-radius:12px}
+.cbar button[hidden]{display:none}
+.control #jobFilePanel{margin-top:0 !important}
+.control #jobFilePanel .actions button{min-height:44px}
+@media (min-width:901px){.cbar{left:50%;transform:translateX(-50%);max-width:720px;border:1px solid var(--line);border-bottom:0;border-radius:14px 14px 0 0}}
 </style>
 </head>
 <body>
 <header>
   <h1>Bridge Camera</h1><span class="ver" id="ver"></span>
-  <nav class="tabs"><a href="/" id="navSetup">Setup</a><a href="/monitor" id="navMonitor">Monitor</a></nav>
+  <nav class="tabs"><a href="/" id="navSetup">Setup</a><a href="/monitor" id="navMonitor">Monitor</a><a href="/control" id="navControl">Control</a></nav>
   <span class="spacer"></span>
   <button id="soundBtn" title="Play a sound for job and laser alerts">🔕</button>
   <a class="pill" id="laserPill" href="/monitor" title="Laser controller" hidden><span class="dot"></span><span id="laserPillText">Laser</span></a>
@@ -185,6 +217,15 @@ a.button{font:inherit;padding:8px 12px;border-radius:7px;border:1px solid var(--
           <button id="restart">Restart camera</button>
         </div>
         <div class="hint" id="cfgHint"></div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>Machine direction</h2>
+      <div class="body">
+        <label class="switch"><input type="checkbox" id="flipX"> Flip X (left ↔ right)</label>
+        <label class="switch"><input type="checkbox" id="flipY"> Flip Y (top ↔ bottom)</label>
+        <div class="hint">Turn on if the job drawing is mirrored compared to the bed, or the jog arrows move the head the wrong way. Saved on the Bridge, so every phone and computer follows it.</div>
       </div>
     </div>
 
@@ -285,12 +326,13 @@ a.button{font:inherit;padding:8px 12px;border-radius:7px;border:1px solid var(--
           <button id="cPause">❚❚ Pause</button>
           <button id="cResume" class="primary">▶ Resume</button>
           <button id="cStop" class="danger">■ Stop</button>
+          <button id="cHome" title="Same as LightBurn's Home: laser off, head to 0, 0">⌂ Home</button>
           <button id="cOrigin" title="Move the head to the origin set on the laser (laser off), like LightBurn's Go to origin">⌖ Go to origin</button>
         </div>
       </div>
     </div>
 
-    <div class="panel" style="margin-top:16px">
+    <div class="panel" style="margin-top:16px" id="jobFilePanel">
       <h2 id="jobFileTitle">Job file</h2>
       <div class="body">
         <div class="jobview"><canvas id="jobCanvas"></canvas><canvas id="jobHead"></canvas></div>
@@ -299,8 +341,6 @@ a.button{font:inherit;padding:8px 12px;border-radius:7px;border:1px solid var(--
           <button id="jobFrame" title="Trace the job's bounding box with the laser off, then return">▭ Frame</button>
           <button id="jobFrameOutline" title="Trace the outline around the job's cuts with the laser off, then return">◯ Outline frame</button>
           <button id="jobFollow" hidden>Show current job</button>
-          <button id="jobFlipX" title="Mirror left/right to match your machine">⇋ Mirror</button>
-          <button id="jobFlipY" title="Flip top/bottom to match your machine">⇵ Flip</button>
           <a class="button" id="jobDownload" hidden>Download raw</a>
         </div>
         <div class="sub">Recent jobs</div>
@@ -335,6 +375,56 @@ a.button{font:inherit;padding:8px 12px;border-radius:7px;border:1px solid var(--
 
     <div class="hint" style="padding:0 4px">Status is read the same way LightBurn does, from a separate address so LightBurn's relay is never disturbed. The buttons send commands to the laser; the Bridge only allows each one when it makes sense (Pause while running, Resume while paused, Stop during a job). Never leave a running laser unattended.</div>
   </aside>
+</main>
+<main id="controlView" class="control" hidden>
+  <section class="side">
+    <div class="panel cstat">
+      <div class="body">
+        <div class="jobhead"><span class="jobstate" id="cState">—</span><span class="jobpct" id="cPct"></span></div>
+        <div class="bar big" id="cBarWrap" hidden><div id="cBarFill"></div></div>
+        <div class="cpos"><span>X <b id="cX">—</b></span><span>Y <b id="cY">—</b></span><span class="cmeta" id="cMeta"></span></div>
+        <div class="hint" id="cNote"></div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>Move</h2>
+      <div class="body">
+        <div class="jogpad" id="jogPad">
+          <button data-j="-1,-1" aria-label="Up left">↖</button><button data-j="0,-1" aria-label="Up">↑</button><button data-j="1,-1" aria-label="Up right">↗</button>
+          <button data-j="-1,0" aria-label="Left">←</button><span id="cOriginSlot"></span><button data-j="1,0" aria-label="Right">→</button>
+          <button data-j="-1,1" aria-label="Down left">↙</button><button data-j="0,1" aria-label="Down">↓</button><button data-j="1,1" aria-label="Down right">↘</button>
+        </div>
+        <label>Distance (mm)</label>
+        <div class="chips" id="jogDist">
+          <button data-d="0.1">0.1</button><button data-d="1">1</button><button data-d="10">10</button><button data-d="50">50</button><button data-d="100">100</button>
+          <input type="number" id="jogDistIn" inputmode="decimal" min="0.01" step="any" aria-label="Distance in mm">
+        </div>
+        <label for="jogSpeed">Speed (mm/s)</label>
+        <input type="number" id="jogSpeed" inputmode="decimal" min="1" max="300" step="any">
+        <label>Move to (mm)</label>
+        <div class="moveto">
+          <input type="number" id="mtX" inputmode="decimal" placeholder="X" aria-label="X in mm">
+          <input type="number" id="mtY" inputmode="decimal" placeholder="Y" aria-label="Y in mm">
+          <button id="mtGo">Go</button>
+        </div>
+        <div class="cbtns" id="cMoveBtns"></div>
+        <div class="hint" id="jogNote">Laser off for every move. Arrows follow the job drawing (Mirror/Flip there); try a small step first.</div>
+      </div>
+    </div>
+  </section>
+
+  <section class="side">
+    <div id="cJobSlot"></div>
+    <div class="panel">
+      <div class="body">
+        <label class="switch"><input type="checkbox" id="cCamOn"> Show camera</label>
+        <div class="preview" id="cCamWrap" style="margin-top:10px" hidden><img id="cCam" alt="Camera"></div>
+      </div>
+    </div>
+  </section>
+
+  <div class="cbar" id="cBarBtns"></div>
 </main>
 <div id="notes" aria-live="polite"></div>
 <div id="toast"></div>
@@ -371,6 +461,7 @@ async function poll(){
     // the Bridge was updated while this page stayed open: load the new dashboard
     if (!poll.version) poll.version = state.version;
     else if (state.version !== poll.version && !busy) return location.reload();
+    applyFlip(state.config);
     render();
   } catch(e) {
     setPill("bad", "Bridge unreachable");
@@ -809,10 +900,12 @@ const CTL = {
   cPause:  {cmd:"pause",  when:["running"]},
   cResume: {cmd:"resume", when:["paused"], ask:"Resume the job?\n\nThe laser will start firing again. Only do this if someone is at the machine."},
   cStop:   {cmd:"stop",   when:["running","paused","moving"], ask:"Stop the job?\n\nA stopped job can't be resumed.", askIf:["running","paused"]},
+  cHome:   {path:"/api/laser/home", when:["idle"], done:"Going home"},
   cOrigin: {path:"/api/laser/origin", when:["idle"], done:"Going to origin"},
 };
 let ctlBusy = false;
 function drawControls(c){
+  if (CONTROL) return drawControlButtons(c);
   const box = $("#ctlBtns");
   if (!c || !c.available) { box.hidden = true; return; }
   box.hidden = false;
@@ -827,6 +920,7 @@ for (const [id, d] of Object.entries(CTL)) {
   $("#" + id).addEventListener("click", async () => {
     const st = JV.ctrl && JV.ctrl.state;
     if (d.ask && (!d.askIf || d.askIf.includes(st)) && !confirm(d.ask)) return;
+    if (d.cmd === "stop" && navigator.vibrate) navigator.vibrate(60);
     ctlBusy = true; document.querySelectorAll("#ctlBtns button").forEach(b => b.disabled = true);
     try {
       if (d.path) { await api(d.path, {}); toast(d.done); ctlBusy = false; loadLaser(); return; }
@@ -848,11 +942,13 @@ for (const [id, d] of Object.entries(CTL)) {
 }
 
 /* ---------- which view: / = setup, /monitor = monitoring ---------- */
-const MONITOR = location.pathname.replace(/\/+$/, "") === "/monitor";
-$("#setupView").hidden = MONITOR;
+const VIEW = {"/monitor": "monitor", "/control": "control"}[location.pathname.replace(/\/+$/, "")] || "setup";
+const MONITOR = VIEW === "monitor", CONTROL = VIEW === "control", LIVE = MONITOR || CONTROL;
+$("#setupView").hidden = VIEW !== "setup";
 $("#monitorView").hidden = !MONITOR;
-$(MONITOR ? "#navMonitor" : "#navSetup").classList.add("on");
-document.title = MONITOR ? "Bridge Monitor" : "Bridge Camera";
+$("#controlView").hidden = !CONTROL;
+$({setup: "#navSetup", monitor: "#navMonitor", control: "#navControl"}[VIEW]).classList.add("on");
+document.title = {setup: "Bridge Camera", monitor: "Bridge Monitor", control: "Laser Control"}[VIEW];
 poll();
 if (MONITOR) {
   // left open for hours: stream only while the tab is visible, so the camera can pause otherwise
@@ -861,7 +957,7 @@ if (MONITOR) {
   const stop = () => { img.onerror = null; img.removeAttribute("src"); };
   document.addEventListener("visibilitychange", () => document.hidden ? stop() : start());
   start();
-} else {
+} else if (!CONTROL) {
   startPreview();
   loadSw();
   loadNet();
@@ -890,7 +986,7 @@ async function loadLaser(fresh){
   if (l.relay && l.relay.message) rows.push(["Last activity", l.relay.message]);
   $("#laserkv").innerHTML = rows.map(([a,b]) => `<dt>${esc(a)}</dt><dd>${esc(b)}</dd>`).join("");
   renderController(l.controller);
-  JV.ctrl = l.controller; if (MONITOR) { jvDraw(); jvFrameButtons(); }
+  JV.ctrl = l.controller; if (LIVE) { jvDraw(); jvFrameButtons(); } if (CONTROL) renderControl(l.controller);
   watchLaser(l);
 }
 const dur = s => { if (s == null) return "—"; s = Math.round(s); const h = Math.floor(s/3600), m = Math.floor(s%3600/60), x = s%60;
@@ -954,7 +1050,7 @@ loadHealth(); setInterval(loadHealth, MONITOR ? 10000 : 30000);  // health alert
 $("#laserCheck").onclick = async () => { $("#laserCheck").disabled = true; await loadLaser(true); $("#laserCheck").disabled = false; toast("Checked"); };
 loadLaser();
 // keep polling when the tab is hidden too, so alerts still arrive
-setInterval(() => { if (!busy) loadLaser(); }, MONITOR ? 2000 : 10000);
+setInterval(() => { if (!busy && !(LIVE && document.hidden)) loadLaser(); }, CONTROL ? 1000 : MONITOR ? 2000 : 10000);
 
 /* ---------- log ---------- */
 async function loadLog(){
@@ -1025,7 +1121,7 @@ function parseRuida(b){
 const JV_PALETTE = ["#111111","#0000ff","#e03131","#2b8a3e","#c77c02","#ae3ec9","#0c8599","#e8590c","#5c940d","#1864ab"];
 const JV = {list: null, pinned: null, shown: null, parsed: null, cache: new Map(), liveBytes: -1, liveAt: 0,
             drawnSig: "", ctrl: null, loading: false,
-            flipX: localStorage.getItem("jvFlipX") === "1", flipY: localStorage.getItem("jvFlipY") === "1"};
+            flipX: false, flipY: false};  // from the Bridge's Setup (state.config)
 function jvColor(P, L){
   const v = P.colors[L];
   return v != null ? `rgb(${v & 255},${(v >> 8) & 255},${(v >> 16) & 255})` : JV_PALETTE[L % JV_PALETTE.length];
@@ -1201,15 +1297,28 @@ async function jvFrame(kind){
 }
 $("#jobFrame").addEventListener("click", () => jvFrame("box"));
 $("#jobFrameOutline").addEventListener("click", () => jvFrame("outline"));
-$("#jobFlipX").addEventListener("click", () => { JV.flipX = !JV.flipX; localStorage.setItem("jvFlipX", JV.flipX ? "1" : "0"); jvDraw(); });
-$("#jobFlipY").addEventListener("click", () => { JV.flipY = !JV.flipY; localStorage.setItem("jvFlipY", JV.flipY ? "1" : "0"); jvDraw(); });
+function applyFlip(c){
+  if (!c) return;
+  const fx = !!c.flip_x, fy = !!c.flip_y;
+  $("#flipX").checked = fx; $("#flipY").checked = fy;
+  if (fx !== JV.flipX || fy !== JV.flipY) { JV.flipX = fx; JV.flipY = fy; jvDraw(); }
+}
+for (const [id, key] of [["#flipX", "flip_x"], ["#flipY", "flip_y"]]) {
+  $(id).addEventListener("change", async e => {
+    const box = e.target;
+    box.disabled = true;
+    try { const r = await api("/api/config", {[key]: box.checked}); applyFlip(r.config); toast("Saved"); }
+    catch(err) { box.checked = !box.checked; toast(err.message, true); }
+    box.disabled = false;
+  });
+}
 $("#jobClear").addEventListener("click", async () => {
   if (!confirm("Delete all captured jobs from the Bridge?")) return;
   try { await api("/api/jobs/clear", {}); JV.cache.clear(); JV.pinned = null; toast("Job history cleared"); } catch(e) { toast(e.message, true); }
   loadJobs();
 });
 window.addEventListener("resize", () => jvDraw());
-if (MONITOR) {
+if (LIVE) {
   loadJobs();
   setInterval(() => { if (!document.hidden) loadJobs(); }, 3000);
 }
@@ -1241,6 +1350,84 @@ $("#recCopy").addEventListener("click", async () => {
   catch(e) { toast("Select the text and copy it manually", true); }
 });
 $("#recPanel").addEventListener("toggle", () => { if ($("#recPanel").open) recPoll(); });
+
+/* ---------- control page (/control): phone-first laser control ---------- */
+function drawControlButtons(c){
+  const ok = c && c.available, st = c && c.state;
+  const moving = ok && (st === "moving" || c.motion);
+  $("#cPause").hidden = !(ok && st === "running");
+  $("#cResume").hidden = !(ok && st === "paused");
+  $("#cStop").hidden = false;
+  $("#cStop").disabled = ctlBusy || !(ok && (["running", "paused"].includes(st) || moving));
+  const idle = ok && st === "idle" && !c.motion;
+  for (const id of ["cHome", "cOrigin"]) { $("#" + id).hidden = false; $("#" + id).disabled = ctlBusy || !idle; }
+  $("#cPause").disabled = $("#cResume").disabled = ctlBusy;
+}
+function renderControl(c){
+  const ok = c && c.available;
+  const st = ok ? ({running:"Running", paused:"Paused", moving:"Moving", idle:"Idle"}[c.state] || c.state) : "Not connected";
+  $("#cState").textContent = st; $("#cState").className = "jobstate " + (ok ? c.state || "" : "");
+  const pct = ok && c.running && c.progress != null;
+  $("#cPct").textContent = pct ? Math.round(c.progress) + "%" : "";
+  $("#cBarWrap").hidden = !pct; $("#cBarFill").style.width = (pct ? c.progress : 0) + "%";
+  const p = (ok && c.position) || {};
+  $("#cX").textContent = p.x != null ? p.x.toFixed(1) : "—"; $("#cY").textContent = p.y != null ? p.y.toFixed(1) : "—";
+  $("#cMeta").textContent = ok && c.running ? (c.paused ? "Paused · " : "") + "Elapsed " + dur(c.elapsed) : ok && c.bed ? "Bed " + c.bed.x + " × " + c.bed.y + " mm" : "";
+  $("#cNote").textContent = ok ? (c.not_firing ? "⚠ The laser hasn't fired yet: check the panel for an alarm." : "") : (c && c.reason ? "Controller: " + c.reason : "");
+  const canJog = ok && !["running", "paused"].includes(c.state) && !(c.state === "moving" && !c.motion);
+  document.querySelectorAll("#jogPad button[data-j], #mtGo").forEach(b => b.disabled = !canJog);
+  wakeLock(ok && ["running", "paused", "moving"].includes(c.state));
+}
+const JOG = {dist: parseFloat(localStorage.getItem("jogDist")) || 10, speed: parseFloat(localStorage.getItem("jogSpeed")) || 100};
+function jogDraw(){
+  document.querySelectorAll("#jogDist button").forEach(b => b.classList.toggle("on", parseFloat(b.dataset.d) === JOG.dist));
+  $("#jogDistIn").value = JOG.dist; $("#jogSpeed").value = JOG.speed;
+}
+async function jogSend(body, label){
+  try { await api("/api/laser/jog", Object.assign({speed: JOG.speed}, body)); }
+  catch(e) { toast(e.message.replace(/^Couldn't move: /, ""), true); }
+  loadLaser();
+}
+if (CONTROL) {
+  // borrow the monitor page's pieces: same elements, same handlers, placed for a phone
+  $("#cJobSlot").replaceWith($("#jobFilePanel"));
+  $("#cOriginSlot").replaceWith($("#cOrigin")); $("#cOrigin").textContent = "⌖ Origin";
+  $("#cMoveBtns").append($("#cHome"));
+  $("#cBarBtns").append($("#cPause"), $("#cResume"), $("#cStop"));
+  $("#cStop").textContent = "■ Stop";
+  jogDraw();
+  $("#jogDist").addEventListener("click", e => { const b = e.target.closest("button"); if (!b) return;
+    JOG.dist = parseFloat(b.dataset.d); localStorage.setItem("jogDist", JOG.dist); jogDraw(); });
+  $("#jogDistIn").addEventListener("change", e => { const v = parseFloat(e.target.value);
+    if (v > 0 && v <= 1000) { JOG.dist = v; localStorage.setItem("jogDist", v); } jogDraw(); });
+  $("#jogSpeed").addEventListener("change", e => { const v = parseFloat(e.target.value);
+    if (v >= 1 && v <= 300) { JOG.speed = v; localStorage.setItem("jogSpeed", v); } else toast("Speed is 1-300 mm/s", true); jogDraw(); });
+  $("#jogPad").addEventListener("click", e => {
+    const b = e.target.closest("button[data-j]"); if (!b || b.disabled) return;
+    const [sx, sy] = b.dataset.j.split(",").map(Number);  // screen directions, matched to the drawing
+    jogSend({dx: sx * JOG.dist * (JV.flipX ? -1 : 1), dy: sy * JOG.dist * (JV.flipY ? -1 : 1)});
+  });
+  $("#mtGo").addEventListener("click", () => {
+    const x = $("#mtX").value === "" ? null : parseFloat($("#mtX").value), y = $("#mtY").value === "" ? null : parseFloat($("#mtY").value);
+    if (x == null && y == null) return toast("Enter X and/or Y", true);
+    jogSend({x, y});
+  });
+  // camera only when asked: phones on mobile data
+  const cam = $("#cCam");
+  const camOn = () => $("#cCamOn").checked && !document.hidden;
+  const camSync = () => { $("#cCamWrap").hidden = !$("#cCamOn").checked;
+    if (camOn()) { if (!cam.src) { cam.onerror = () => setTimeout(() => { cam.removeAttribute("src"); camSync(); }, 2000); cam.src = "/stream?t=" + Date.now(); } }
+    else { cam.onerror = null; cam.removeAttribute("src"); } };
+  $("#cCamOn").addEventListener("change", camSync);
+  document.addEventListener("visibilitychange", () => { camSync(); if (!document.hidden) loadLaser(); });
+}
+let wakeSentinel = null;
+async function wakeLock(on){  // keep the phone's screen on during a job (secure pages only)
+  try {
+    if (on && !wakeSentinel && navigator.wakeLock && !document.hidden) { wakeSentinel = await navigator.wakeLock.request("screen"); wakeSentinel.addEventListener("release", () => wakeSentinel = null); }
+    else if (!on && wakeSentinel) { await wakeSentinel.release(); wakeSentinel = null; }
+  } catch(e) { /* not allowed on plain http: fine */ }
+}
 </script>
 </body>
 </html>

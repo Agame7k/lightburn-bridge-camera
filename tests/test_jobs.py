@@ -369,6 +369,14 @@ class GeometryTest(unittest.TestCase):
         pts = [(0, 0), (10, 0), (10, 10), (0, 10), (5, 5), (5, 0)]
         self.assertEqual(app.convex_hull(pts), [(0, 0), (10, 0), (10, 10), (0, 10)])
 
+    def test_passed(self):
+        t = [(0, 0), (10000, 0), (10000, 10000)]
+        self.assertEqual(app.passed((0, 0), t), 0)
+        self.assertEqual(app.passed((5000, 100), t), 0)      # between the first and second
+        self.assertEqual(app.passed((10000, 9999), t), 2)    # at the last (polls missed the middle)
+        self.assertEqual(app.passed((-20000, 5000), t), -1)
+        self.assertEqual(app.passed((10000, 4000), t), 1)
+
     def test_rapid_refuses_silly_positions(self):
         for x, y in ((-1, 0), (0, app.MAX_COORD + 1)):
             with self.assertRaises(app.RuidaCommandError):
@@ -399,8 +407,8 @@ class RuidaHookTest(unittest.TestCase):
 class HttpJobsTest(StoreBase):
     def setUp(self):
         super().setUp()
-        cfg = app.Config(os.path.join(self.tmp, "cfg.json"))
-        cam = app.Camera(cfg, b"\xff\xd8placeholder")
+        cfg = self.cfg = app.Config(os.path.join(self.tmp, "cfg.json"))
+        cam = self.cam = app.Camera(cfg, b"\xff\xd8placeholder")
         self.cap = app.JobCapture(FakeLaser(), FakeRuida(), self.store, enabled=False)
         self.moves = []
         test = self
@@ -432,6 +440,26 @@ class HttpJobsTest(StoreBase):
         data = resp.read()
         c.close()
         return resp.status, data
+
+    def test_flip_setting(self):
+        post = lambda b: self.req("POST", "/api/config", {"X-LBCam": "1", "Content-Type": "application/json"},
+                                  json.dumps(b).encode())
+        self.assertEqual((self.cfg.public()["flip_x"], self.cfg.public()["flip_y"]), (False, False))
+        self.cam.reopen.clear()
+        st, data = post({"flip_x": True})
+        self.assertEqual(st, 200)
+        c = json.loads(data.decode())["config"]
+        self.assertEqual((c["flip_x"], c["flip_y"]), (True, False))
+        self.assertFalse(self.cam.reopen.is_set())  # flipping doesn't restart the camera
+        self.assertEqual(post({"flip_y": "yes"})[0], 400)
+        self.assertEqual(post({"flip_y": True})[0], 200)
+        st, data = self.req("GET", "/api/state")
+        c = json.loads(data.decode())["config"]
+        self.assertEqual((c["flip_x"], c["flip_y"]), (True, True))
+        again = app.Config(self.cfg.path)  # saved on the Bridge
+        self.assertEqual((again.get("flip_x"), again.get("flip_y")), (True, True))
+        post({"fps": 10})
+        self.assertTrue(self.cam.reopen.is_set())
 
     def test_list_download_clear(self):
         jid = self.store.add(square_job(), 1000.0, 1001.0, True)

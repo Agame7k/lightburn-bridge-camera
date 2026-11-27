@@ -417,7 +417,7 @@ class MotionTest(CommandTest):
 
     def test_home_is_lightburns_bytes(self):
         self.r.home(who="test")
-        self.assertEqual([c.hex(" ").upper() for c in self.ctrl.commands], [
+        self.assertEqual([" ".join("%02X" % x for x in c) for c in self.ctrl.commands], [
             "C9 02 00 00 06 0D 20", "C6 01 00 00", "C6 21 00 00",
             "D0 29 89 89 D9 10 00 00 00 00 00 00 00 00 00 00 00"])  # one packet, as recorded
 
@@ -450,7 +450,7 @@ class MotionTest(CommandTest):
     def test_box_frame_matches_lightburn_and_returns(self):
         box = [(306000, 40000), (306000, 332000), (626000, 332000), (626000, 40000), (306000, 40000)]
         self.r.frame(box)
-        hx = lambda b: b.hex(" ").upper()
+        hx = lambda b: " ".join("%02X" % x for x in b)  # hex(sep) needs 3.8
         c = [hx(x) for x in self.ctrl.commands]
         self.assertEqual(c[:5], ["C9 02 00 00 00 00 00", "C6 01 00 00", "C6 02 00 00", "C6 21 00 00", "C6 22 00 00"])
         self.assertIn("C9 02 00 00 06 0D 20", c)  # 100 mm/s for the frame itself

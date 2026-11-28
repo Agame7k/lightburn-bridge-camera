@@ -49,7 +49,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "3.6"
+VERSION = "3.7"
 LBCAM_HOME = os.environ.get("LBCAM_HOME", "/opt/lbcam")
 
 # ======================================================================== V4L2
@@ -475,6 +475,34 @@ def read_asset(name, default=b""):
         return f.read()
 
 
+# The Bridge is powered from the laser, so switching the laser off cuts power with no
+# shutdown: every file we keep has to survive that at any moment.
+
+def fsync_dir(path):
+    """Make a create/rename inside `path` reach the disk (best effort: not every filesystem allows it)."""
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def write_durable(path, data):
+    """Replace `path` with `data` (bytes or str) so a power cut leaves the old or the new file, never a torn one."""
+    tmp = path + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(data.encode() if isinstance(data, str) else data)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+    fsync_dir(os.path.dirname(os.path.abspath(path)))
+
+
 # ======================================================================== config
 
 
@@ -496,17 +524,29 @@ class Config:
         self.save_error = None
         self._written = None   # last JSON written, to skip identical writes
         self._timer = None     # pending batched save
-        try:
-            with open(path) as f:
-                saved = json.load(f)
+        # path + ".tmp" is only ever a complete, synced copy waiting to be renamed in; on the
+        # FAT /boot partition a power cut during that rename can leave it as the only good copy.
+        for src in (path, path + ".tmp"):
+            try:
+                with open(src) as f:
+                    saved = json.load(f)
+                if not isinstance(saved, dict):
+                    raise ValueError("not a JSON object")
+            except FileNotFoundError:
+                continue
+            except Exception as e:
+                if src == path:
+                    self.load_error = "could not read %s: %s (using defaults)" % (path, e)
+                continue
             for k in ("device", "width", "height", "fps", "controls", "update_auth",
                       "flip_x", "flip_y"):
                 if k in saved:
                     self.data[k] = saved[k]
-        except FileNotFoundError:
-            pass
-        except Exception as e:
-            self.load_error = "could not read %s: %s (using defaults)" % (path, e)
+            if src != path:
+                self.load_error = None
+                log("settings recovered from", src, "(the last save was cut off)")
+            break
+        if self.load_error:
             log(self.load_error)
 
     def get(self, k):
@@ -566,13 +606,8 @@ class Config:
         if self._timer is not None:  # an immediate save covers any batched one
             self._timer.cancel()
             self._timer = None
-        tmp = self.path + ".tmp"
         try:
-            with open(tmp, "w") as f:
-                f.write(text)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(tmp, self.path)
+            write_durable(self.path, text)
             self._written = text
             self.save_error = None
         except Exception as e:
@@ -694,11 +729,15 @@ class Updater:
                         os.fsync(f.fileno())
                 with open(os.path.join(stage, "manifest.json"), "w") as f:
                     json.dump(manifest, f, indent=2)
+                    f.flush()
+                    os.fsync(f.fileno())
+                fsync_dir(stage)
                 self._selftest(stage, version)
                 final = os.path.join(releases, version)
                 if os.path.exists(final):
                     shutil.rmtree(final)
                 os.rename(stage, final)
+                fsync_dir(releases)  # the release is on disk before "current" can point at it
             except Exception:
                 shutil.rmtree(stage, ignore_errors=True)
                 raise
@@ -788,17 +827,14 @@ class Updater:
                 pass
             os.symlink(tgt, tmp)
             os.replace(tmp, os.path.join(home, name))
+            fsync_dir(home)
 
         link("previous", cur)
         link("current", target)
-        tmp = os.path.join(home, "pending.json.tmp")
-        with open(tmp, "w") as f:
-            # restore_previous: what "previous" should point at again if this version gets rolled back
-            json.dump({"version": version, "from": VERSION, "time": int(time.time()),
-                       "restore_previous": old_prev}, f)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, os.path.join(home, "pending.json"))
+        # restore_previous: what "previous" should point at again if this version gets rolled back
+        write_durable(os.path.join(home, "pending.json"),
+                      json.dumps({"version": version, "from": VERSION, "time": int(time.time()),
+                                  "restore_previous": old_prev}))
         log("switching to", version, "- restarting")
         threading.Timer(1.0, self.restart).start()  # launcher starts + health-checks the new one
 
@@ -1068,12 +1104,7 @@ class Network:
                 pass
 
     def _write_pending(self, data):
-        tmp = self.pending_path + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(data, f)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, self.pending_path)
+        write_durable(self.pending_path, json.dumps(data))
 
     def _clear(self):
         if self.timer:
@@ -2278,7 +2309,42 @@ class JobStore:
                 idx = json.load(f)
             idx = [j for j in idx if JOB_ID_RE.match(str(j.get("id"))) and os.path.isfile(self._file(j["id"]))]
         except (OSError, ValueError, AttributeError, TypeError):
-            return []
+            idx = []
+        # A power cut between storing a job and saving the index (or a lost index) leaves .rd
+        # files the index doesn't list: add them back with what the file itself tells us.
+        known = {j["id"] for j in idx}
+        found = []
+        try:
+            names = sorted(os.listdir(self.path))
+        except OSError:
+            names = []
+        for name in names:
+            if name.endswith(".tmp"):  # half-written by a save the power cut stopped
+                try:
+                    os.unlink(os.path.join(self.path, name))
+                except OSError:
+                    pass
+                continue
+            jid = name[:-3]
+            if name.endswith(".rd") and JOB_ID_RE.match(jid) and jid not in known:
+                entry = self._recover(jid)
+                if entry:
+                    found.append(entry)
+                else:  # torn by a power cut (jobs without cuts are never stored)
+                    try:
+                        os.unlink(self._file(jid))
+                    except OSError:
+                        pass
+        if found:
+            log("jobs: recovered %d job(s) missing from the index" % len(found))
+            idx = sorted(idx + found, key=lambda j: j["id"])[-self.keep:]
+            keep = {j["id"] for j in idx}
+            for j in found:
+                if j["id"] not in keep:
+                    try:
+                        os.unlink(self._file(j["id"]))
+                    except OSError:
+                        pass
         for j in idx:  # captured by an older version: work out the placement now
             if "placement" not in j:
                 try:
@@ -2290,11 +2356,27 @@ class JobStore:
                     pass
         return idx
 
+    def _recover(self, jid):
+        """An index entry rebuilt from a job file alone (run history is lost), or None if unusable."""
+        try:
+            with open(self._file(jid), "rb") as f:
+                data = f.read()
+            start = time.mktime(time.strptime(jid[:15], "%Y%m%d-%H%M%S"))
+            end = os.path.getmtime(self._file(jid))
+        except (OSError, ValueError, OverflowError):
+            return None
+        try:
+            if not job_cuts(data):
+                return None
+            geo = ruida_job_geometry(data)
+        except Exception:  # noqa: BLE001 - a torn file is skipped, not fatal
+            return None
+        return {"id": jid, "start": start, "end": max(start, end), "bytes": len(data), "cuts": job_cuts(data),
+                "complete": data.endswith(bytes((JOB_EOF,))), "runs": [], "absolute": geo["absolute"],
+                "placement": geo["placement"], "bounds": list(geo["bounds"]) if geo["bounds"] else None}
+
     def _save(self):
-        tmp = os.path.join(self.path, "index.json.tmp")
-        with open(tmp, "w") as f:
-            json.dump(self.index, f)
-        os.replace(tmp, os.path.join(self.path, "index.json"))
+        write_durable(os.path.join(self.path, "index.json"), json.dumps(self.index))
 
     def add(self, data, start, end, complete):
         jid = time.strftime("%Y%m%d-%H%M%S", time.localtime(start)) + "-" + hashlib.sha1(data).hexdigest()[:6]
@@ -2303,8 +2385,7 @@ class JobStore:
                  "complete": complete, "runs": [], "absolute": geo["absolute"],
                  "placement": geo["placement"], "bounds": list(geo["bounds"]) if geo["bounds"] else None}
         with self.lock:
-            with open(self._file(jid), "wb") as f:
-                f.write(data)
+            write_durable(self._file(jid), data)  # on disk before the index lists it
             self.index = [j for j in self.index if j["id"] != jid] + [entry]
             for run in list(self.unmatched):
                 if self._matches(entry, run):

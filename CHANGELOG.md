@@ -3,6 +3,22 @@
 Versions are the `VERSION` in `lbcam_stream.py` and the name of the update file
 (`lbcam-update-<version>.tar.gz`). Newest first.
 
+## 3.7 (2026-11-27)
+
+The Bridge is powered from the laser, so switching the laser off cuts its power with no
+shutdown. Saving is now safe against that at any moment:
+
+- Captured jobs are written to the SD card before the job list points at them. If power goes
+  before the list is saved, the job is added back on the next start (without its run history).
+  A missing or damaged job list is rebuilt from the job files.
+- Settings on `/boot` (camera, image controls, update password) are recovered from the last
+  complete save if power is cut while that save is replacing the old file.
+- Updates: the new release is fully on disk before the Bridge switches to it, and a power cut
+  in the middle of an automatic rollback no longer makes the next start roll back one version
+  too far.
+  (The rollback fix is in `launcher.py`, which an uploaded update never changes: it takes
+  effect after `upgrade_over_ssh.sh` or a fresh image. Everything else arrives with the upload.)
+
 ## 3.6 (2026-11-27)
 
 - The *Camera not connected* image is now live: a status bar with a pulsing dot and a timer

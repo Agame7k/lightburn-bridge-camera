@@ -44,6 +44,20 @@ def read_json(path):
         return None
 
 
+def fsync_dir(path):
+    """Make a rename inside `path` reach the disk: the Bridge loses power whenever the laser is switched off."""
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
 def write_json(path, data):
     tmp = path + ".tmp"
     with open(tmp, "w") as f:
@@ -51,6 +65,7 @@ def write_json(path, data):
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp, path)
+    fsync_dir(os.path.dirname(path) or ".")
 
 
 def set_link(name, target):
@@ -62,6 +77,7 @@ def set_link(name, target):
         pass
     os.symlink(target, tmp)
     os.replace(tmp, p(name))
+    fsync_dir(HOME)
 
 
 def link_target(name):
@@ -114,12 +130,41 @@ def rollback(bad_version, reason, restore_previous=None):
     write_json(p("last_update.json"), result)
 
 
+def rollback_was_interrupted(pending):
+    """True (and tidied up) if a power cut hit a rollback after "current" was already restored.
+
+    pending.json is only written once "current" points at the new release, so if it no
+    longer does, the rollback got that far. Checking the restored version against the
+    pending one would fail and roll back a second, healthy version.
+    """
+    want = str(pending.get("version"))
+    cur = os.path.realpath(p("current"))
+    if os.path.basename(cur) == want or not os.path.isfile(os.path.join(cur, "lbcam_stream.py")):
+        return False
+    log("finishing a rollback of", want, "that a power cut interrupted")
+    try:
+        os.unlink(p("pending.json"))
+    except FileNotFoundError:
+        pass
+    last = read_json(p("last_update.json")) or {}
+    if last.get("version") != want or last.get("result") != "rolled_back":
+        write_json(p("last_update.json"), {
+            "result": "rolled_back", "version": want, "time": int(time.time()),
+            "reason": "rolled back (the Bridge lost power while it was rolling back)",
+            "restored": os.path.basename(cur)})
+    else:
+        fsync_dir(HOME)
+    return True
+
+
 def main():
     log("starting, home", HOME)
     while True:
         cur = os.path.realpath(p("current"))
         script = os.path.join(cur, "lbcam_stream.py")
         pending = read_json(p("pending.json"))
+        if pending and rollback_was_interrupted(pending):
+            continue
         if not os.path.isfile(script):
             if pending:
                 rollback(pending.get("version"), "release files missing", pending.get("restore_previous"))

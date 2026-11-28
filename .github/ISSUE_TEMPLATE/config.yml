@@ -1,7 +1,7 @@
 blank_issues_enabled: false
 contact_links:
   - name: Security problem
-    url: https://github.com/Agame7k/lightburn-bridge-camera/security/advisories/new
+    url: https://github.com/Agame7k/BridgeDeck/security/advisories/new
     about: Report vulnerabilities privately, please.
   - name: LightBurn itself
     url: https://forum.lightburnsoftware.com/

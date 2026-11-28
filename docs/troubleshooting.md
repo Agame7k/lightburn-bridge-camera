@@ -18,7 +18,7 @@
 
 
 
-Still stuck? Open an [issue](https://github.com/Agame7k/lightburn-bridge-camera/issues/new/choose) with the Bridge's log (the log viewer on the Setup page) and, for laser problems, a **Record laser traffic** capture.
+Still stuck? Open an [issue](https://github.com/Agame7k/BridgeDeck/issues/new/choose) with the Bridge's log (the log viewer on the Setup page) and, for laser problems, a **Record laser traffic** capture.
 
 ---
 

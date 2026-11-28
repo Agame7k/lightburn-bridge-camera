@@ -3,7 +3,7 @@
 ## Reporting a vulnerability
 
 Please **don't open a public issue** for security problems. Use GitHub's
-[private vulnerability reporting](https://github.com/Agame7k/lightburn-bridge-camera/security/advisories/new)
+[private vulnerability reporting](https://github.com/Agame7k/BridgeDeck/security/advisories/new)
 instead. You'll get a reply as soon as possible, and credit in the changelog if you want it.
 
 Especially interesting: anything that lets someone on the network (or a web page in their

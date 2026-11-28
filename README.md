@@ -7,8 +7,8 @@
 Plug a USB camera into the Bridge and use it in LightBurn over WiFi, then watch and steer
 your laser from any phone or browser on the network.
 
-[![CI](https://github.com/Agame7k/lightburn-bridge-camera/actions/workflows/ci.yml/badge.svg)](https://github.com/Agame7k/lightburn-bridge-camera/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/Agame7k/lightburn-bridge-camera?sort=semver)](https://github.com/Agame7k/lightburn-bridge-camera/releases)
+[![CI](https://github.com/Agame7k/BridgeDeck/actions/workflows/ci.yml/badge.svg)](https://github.com/Agame7k/BridgeDeck/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/Agame7k/BridgeDeck?sort=semver)](https://github.com/Agame7k/BridgeDeck/releases)
 ![Python 3.7+](https://img.shields.io/badge/python-3.7%2B-3776AB?logo=python&logoColor=white)
 ![Zero dependencies](https://img.shields.io/badge/dependencies-none-brightgreen)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
@@ -140,7 +140,7 @@ Otherwise use `http://<bridge-ip>:8080/stream`. Then run *Calibrate Camera Lens*
 |---|---|
 | Bridge image v1.0-RC4 | ✅ tested |
 | Ruida RDC6442G | ✅ status, pause / resume / stop, jog, home, origin, frame verified |
-| Other Ruida controllers | 🟡 probably; `/api/laser` shows the raw values — please [report](https://github.com/Agame7k/lightburn-bridge-camera/issues/new/choose) |
+| Other Ruida controllers | 🟡 probably; `/api/laser` shows the raw values — please [report](https://github.com/Agame7k/BridgeDeck/issues/new/choose) |
 | Non-Ruida controllers | ❌ camera works, laser features don't |
 
 ## License

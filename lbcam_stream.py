@@ -47,7 +47,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "3.4"
+VERSION = "3.5"
 LBCAM_HOME = os.environ.get("LBCAM_HOME", "/opt/lbcam")
 
 # ======================================================================== V4L2

@@ -3,10 +3,13 @@
 Versions are the `VERSION` in `lbcam_stream.py` and the name of the update file
 (`lbcam-update-<version>.tar.gz`). Newest first.
 
-## Unreleased
+## 3.5 (2026-11-27)
 
 - The project is now called **BridgeDeck**. Page titles and the header say so; nothing else
-  changes (the service, files and update files are still `lbcam`).
+  changes (the service, files and update files are still `lbcam`, so updating from 3.4 works
+  as usual).
+- New README with a quick start; the detailed docs moved to `docs/`. Added CONTRIBUTING,
+  SECURITY and GitHub issue templates.
 
 ## 3.4 (2026-11-27)
 

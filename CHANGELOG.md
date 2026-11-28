@@ -3,7 +3,7 @@
 Versions are the `VERSION` in `lbcam_stream.py` and the name of the update file
 (`lbcam-update-<version>.tar.gz`). Newest first.
 
-## Unreleased
+## 3.6 (2026-11-27)
 
 - The *Camera not connected* image is now live: a status bar with a pulsing dot and a timer
   counting how long the Bridge has been waiting, updated every second. A frozen image now means

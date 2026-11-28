@@ -50,7 +50,8 @@ flowchart LR
   overlay, Print and Cut and alignment all work.
 - **Setup page** with live preview, camera / resolution / frame-rate pickers that show what the
   camera really supports, and image controls (exposure, focus, white balance…) saved per camera.
-- Serves a *Camera not connected* image instead of a dead stream, and recovers on its own
+- Serves a *Camera not connected* image instead of a dead stream, with a pulsing dot and a
+  "waiting" timer so you can tell the Bridge is alive, and recovers on its own
   when the camera is plugged back in. Idles the camera when nobody is watching.
 
 ### 📊 Monitor page — leave it open next to the laser

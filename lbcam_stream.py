@@ -22,6 +22,7 @@ Settings are saved to CAM_CONFIG (default /boot/lbcam.json, editable from any co
 Environment variables give the defaults: CAM_DEVICE, CAM_WIDTH, CAM_HEIGHT, CAM_FPS, CAM_PORT.
 """
 
+import base64
 import ctypes
 import errno
 import fcntl
@@ -30,6 +31,7 @@ import hashlib
 import hmac
 import io
 import json
+import math
 import mmap
 import os
 import re
@@ -2695,12 +2697,225 @@ def pi_health():
     return h
 
 
+class LivePlaceholder:
+    """Animates placeholder.jpg (pulsing dot + "waiting" timer) without an image library.
+
+    make_placeholder.py saves the image with a restart marker after every MCU, so each
+    MCU is an independent run of bytes. Only the few MCUs under the dot and the timer are
+    re-encoded here (baseline JPEG, the image's own quant/Huffman tables); every other MCU
+    is copied as-is. The layout, colours and glyphs come from a JSON COM segment.
+    Raises ValueError for any image it cannot animate - the caller then serves it static.
+    """
+
+    ZIGZAG = (0, 1, 8, 16, 9, 2, 3, 10, 17, 24, 32, 25, 18, 11, 4, 5, 12, 19, 26, 33, 40, 48,
+              41, 34, 27, 20, 13, 6, 7, 14, 21, 28, 35, 42, 49, 56, 57, 50, 43, 36, 29, 22, 15,
+              23, 30, 37, 44, 51, 58, 59, 52, 45, 38, 31, 39, 46, 53, 60, 61, 54, 47, 55, 62, 63)
+    COS = [[(0.5 / 2 ** 0.5 if u == 0 else 0.5) * math.cos((2 * x + 1) * u * math.pi / 16)
+            for x in range(8)] for u in range(8)]
+
+    def __init__(self, data):
+        if data[:2] != b"\xff\xd8":
+            raise ValueError("not a JPEG")
+        quant, huff, comps, spec, dri = {}, {}, None, None, 0
+        header, i = [data[:2]], 2
+        while True:
+            if i + 4 > len(data) or data[i] != 0xFF:
+                raise ValueError("bad marker at %d" % i)
+            m = data[i + 1]
+            n = struct.unpack(">H", data[i + 2:i + 4])[0]
+            seg = data[i + 4:i + 2 + n]
+            if m == 0xFE:  # COM: the live layout (not repeated in every frame we send)
+                try:
+                    obj = json.loads(seg.decode())
+                    if isinstance(obj, dict) and obj.get("lbcam_live"):
+                        spec = obj
+                        i += 2 + n
+                        continue
+                except ValueError:
+                    pass
+            header.append(data[i:i + 2 + n])
+            if m == 0xDB:
+                j = 0
+                while j < len(seg):
+                    if seg[j] >> 4:
+                        raise ValueError("16-bit quant tables are not supported")
+                    quant[seg[j] & 15] = seg[j + 1:j + 65]
+                    j += 65
+            elif m == 0xC4:
+                j = 0
+                while j < len(seg):
+                    bits = seg[j + 1:j + 17]
+                    vals = seg[j + 17:j + 17 + sum(bits)]
+                    huff[(seg[j] >> 4, seg[j] & 15)] = self._codes(bits, vals)
+                    j += 17 + sum(bits)
+            elif m == 0xC0:
+                height, width = struct.unpack(">HH", seg[1:5])
+                comps = {seg[6 + 3 * k]: (seg[7 + 3 * k] >> 4, seg[7 + 3 * k] & 15, seg[8 + 3 * k])
+                         for k in range(seg[5])}
+            elif 0xC1 <= m <= 0xCF and m not in (0xC4, 0xC8, 0xCC):
+                raise ValueError("only baseline JPEG is supported")
+            elif m == 0xDD:
+                dri = struct.unpack(">H", seg[:2])[0]
+            elif m == 0xDA:
+                scan = [(seg[1 + 2 * k], seg[2 + 2 * k] >> 4, seg[2 + 2 * k] & 15) for k in range(seg[0])]
+                body = data[i + 2 + n:data.rindex(b"\xff\xd9")]
+                break
+            i += 2 + n
+        if not spec or not comps or dri != 1:
+            raise ValueError("image has no live layout (rebuild it with make_placeholder.py)")
+        self.hmax = max(c[0] for c in comps.values())
+        self.vmax = max(c[1] for c in comps.values())
+        self.mw, self.mh = 8 * self.hmax, 8 * self.vmax
+        self.cols = -(-width // self.mw)
+        self.mcus = re.split(rb"\xff[\xd0-\xd7]", body)
+        if len(self.mcus) != self.cols * -(-height // self.mh):
+            raise ValueError("restart intervals do not match the image size")
+        self.header = b"".join(header)
+        self.plan = []  # per scan component: (h, v, sx, sy, quant, dc codes, ac codes)
+        for cid, td, ta in scan:
+            h, v, tq = comps[cid]
+            if self.hmax % h or self.vmax % v:
+                raise ValueError("unsupported sampling")
+            self.plan.append((h, v, self.hmax // h, self.vmax // v, quant[tq], huff[(0, td)], huff[(1, ta)]))
+
+        self.cell_w, self.cell_h = spec["cell"]
+        self.bg, self.fg = tuple(spec["bg"]), tuple(spec["fg"])
+        self.dot_on, self.dot_off = tuple(spec["dot_on"]), tuple(spec["dot_off"])
+        self.dot_xy = tuple(spec["dot"])
+        self.dot_mask = base64.b64decode(spec["dot_mask"])
+        cx, cy, cells = spec["clock"]
+        self.clock_xy, self.clock_w = (cx, cy), cells * self.cell_w
+        self.glyphs = {ch: (w, base64.b64decode(a)) for ch, (w, a) in spec["glyphs"].items()}
+        for x, y in (self.dot_xy, self.clock_xy):
+            if x % self.mw or y % self.mh or self.cell_w % self.mw or self.cell_h % self.mh:
+                raise ValueError("live cells are not MCU aligned")
+        self.cache = {}
+
+    @staticmethod
+    def _codes(bits, vals):
+        table, code, k = {}, 0, 0
+        for length in range(1, 17):
+            for _ in range(bits[length - 1]):
+                table[vals[k]] = (code, length)
+                code, k = code + 1, k + 1
+            code <<= 1
+        return table
+
+    # ------------------------------------------------------------ encoding
+
+    def _block(self, px, q, dc_t, ac_t, pred, out):
+        """DCT + quantise + Huffman-code one 8x8 block (px: 64 level-shifted samples)."""
+        C = self.COS
+        rows = [[sum(C[u][x] * px[y * 8 + x] for x in range(8)) for u in range(8)] for y in range(8)]
+        coef = [sum(C[v][y] * rows[y][u] for y in range(8)) for v in range(8) for u in range(8)]
+        zz = [int(round(coef[self.ZIGZAG[k]] / q[k])) for k in range(64)]
+
+        def put(table, sym, value, size):
+            code, length = table[sym]
+            out.append((code, length))
+            if size:
+                out.append((value if value >= 0 else value + (1 << size) - 1, size))
+
+        diff = zz[0] - pred
+        put(dc_t, diff and abs(diff).bit_length(), diff, abs(diff).bit_length())
+        run = 0
+        for k in range(1, 64):
+            a = zz[k]
+            if a == 0:
+                run += 1
+                continue
+            while run > 15:
+                put(ac_t, 0xF0, 0, 0)
+                run -= 16
+            size = abs(a).bit_length()
+            put(ac_t, (run << 4) | size, a, size)
+            run = 0
+        if run:
+            put(ac_t, 0x00, 0, 0)
+        return zz[0]
+
+    def _mcu(self, alpha, color):
+        """Encode one MCU of `color` over the background with coverage `alpha` (mw*mh bytes)."""
+        key = (alpha, color)
+        hit = self.cache.get(key)
+        if hit is not None:
+            return hit
+        planes = ([], [], [])
+        for a in alpha:
+            t = a / 255.0
+            r, g, b = (bg + (fg - bg) * t for bg, fg in zip(self.bg, color))
+            planes[0].append(0.299 * r + 0.587 * g + 0.114 * b - 128)
+            planes[1].append(-0.168736 * r - 0.331264 * g + 0.5 * b)
+            planes[2].append(0.5 * r - 0.418688 * g - 0.081312 * b)
+        out = []
+        for ci, (h, v, sx, sy, q, dc_t, ac_t) in enumerate(self.plan):
+            plane, pred, area = planes[min(ci, 2)], 0, sx * sy
+            for by in range(v):
+                for bx in range(h):
+                    px = []
+                    for y in range(8):
+                        y0 = (by * 8 + y) * sy
+                        for x in range(8):
+                            x0 = (bx * 8 + x) * sx
+                            px.append(sum(plane[(y0 + dy) * self.mw + x0 + dx]
+                                          for dy in range(sy) for dx in range(sx)) / area)
+                    pred = self._block(px, q, dc_t, ac_t, pred, out)
+        acc = nbits = 0
+        for code, length in out:
+            acc, nbits = (acc << length) | code, nbits + length
+        pad = -nbits % 8
+        acc, nbits = (acc << pad) | ((1 << pad) - 1), nbits + pad
+        data = acc.to_bytes(nbits // 8, "big").replace(b"\xff", b"\xff\x00")
+        if len(self.cache) > 2048:
+            self.cache.clear()
+        self.cache[key] = data
+        return data
+
+    def _paint(self, mcus, x, y, w, alpha, color):
+        """Replace the MCUs under a w x cell_h coverage map at (x, y)."""
+        for my in range(0, self.cell_h, self.mh):
+            for mx in range(0, w, self.mw):
+                a = b"".join(alpha[(my + r) * w + mx:(my + r) * w + mx + self.mw] for r in range(self.mh))
+                mcus[((y + my) // self.mh) * self.cols + (x + mx) // self.mw] = self._mcu(a, color)
+
+    def frame(self, seconds, pulse=True):
+        """The placeholder showing `seconds` waited, with the dot lit (pulse) or dim."""
+        mcus = list(self.mcus)
+        self._paint(mcus, self.dot_xy[0], self.dot_xy[1], self.cell_w, self.dot_mask,
+                    self.dot_on if pulse else self.dot_off)
+        s = min(int(seconds), 99 * 3600 + 59 * 60 + 59)
+        text = "%02d:%02d:%02d" % (s // 3600, s // 60 % 60, s % 60)
+        w, h = self.clock_w, self.cell_h
+        strip = bytearray(w * h)
+        x = 0
+        for ch in text:
+            gw, g = self.glyphs[ch]
+            for r in range(h):
+                n = min(gw, w - x)
+                if n > 0:
+                    strip[r * w + x:r * w + x + n] = g[r * gw:r * gw + n]
+            x += gw
+        self._paint(mcus, self.clock_xy[0], self.clock_xy[1], w, bytes(strip), self.fg)
+        parts = [self.header]
+        for k, m in enumerate(mcus):
+            parts.append(m)
+            parts.append(bytes((0xFF, 0xD0 + k % 8)) if k + 1 < len(mcus) else b"\xff\xd9")
+        return b"".join(parts)
+
+
 class Camera:
     """Owns the capture device. Publishes live frames, or the placeholder when no camera is usable."""
 
     def __init__(self, cfg, placeholder):
         self.cfg = cfg
         self.placeholder = placeholder
+        self.animated = None  # LivePlaceholder: dot + timer so viewers see the Bridge is alive
+        if placeholder:
+            try:
+                self.animated = LivePlaceholder(placeholder)
+            except Exception as e:  # noqa: BLE001 - any odd image just stays static
+                log("placeholder will not animate:", e)
+        self.waiting_since = None  # when we started serving the placeholder
         self.state = "starting"  # starting | searching | streaming | idle | error
         self.message = ""
         self.info = {}
@@ -2763,13 +2978,27 @@ class Camera:
                 self.cond.wait(timeout)
             return self.frame_id, self.frame
 
+    def _placeholder_frame(self):
+        """The "Camera not connected" image, with the timer/dot updated when it can animate."""
+        if self.animated:
+            waited = time.time() - self.waiting_since
+            try:
+                return self.animated.frame(waited, pulse=int(waited) % 2 == 0)
+            except Exception as e:  # noqa: BLE001 - never let the animation stop the stream
+                log("placeholder animation failed, serving it static:", e)
+                self.animated = None
+        return self.placeholder
+
     def _idle(self, seconds):
-        """Sleep while serving the placeholder about once a second; return early on reopen."""
+        """Sleep while serving the placeholder once a second; return early on reopen."""
         end = time.time() + seconds
+        if self.waiting_since is None:
+            self.waiting_since = time.time()
         while self.running and not self.reopen.is_set() and time.time() < end:
             if self.placeholder:
-                self._publish(self.placeholder, False)
-            self.reopen.wait(min(1.0, max(0.0, end - time.time())))
+                self._publish(self._placeholder_frame(), False)
+            tick = 1.0 - (time.time() - self.waiting_since) % 1.0  # on the timer's next second
+            self.reopen.wait(min(tick, max(0.0, end - time.time())))
 
     # ------------------------------------------------------------ choose device
 
@@ -2904,6 +3133,7 @@ class Camera:
             with self.fd_lock:
                 self.fd, self.cam_id = fd, cam_id
             self._set("streaming", note or "")
+            self.waiting_since = None
             log("streaming", self.info)
             went_idle = False
             try:

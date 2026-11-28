@@ -3,6 +3,14 @@
 Versions are the `VERSION` in `lbcam_stream.py` and the name of the update file
 (`lbcam-update-<version>.tar.gz`). Newest first.
 
+## Unreleased
+
+- The *Camera not connected* image is now live: a status bar with a pulsing dot and a timer
+  counting how long the Bridge has been waiting, updated every second. A frozen image now means
+  the Bridge (or the network) has stopped, not just that the camera is missing. Done without
+  any image library: only the dot and timer blocks of the JPEG are re-encoded.
+  `make_placeholder.py` rebuilds the image if it ever needs changing.
+
 ## 3.5 (2026-11-27)
 
 - The project is now called **BridgeDeck**. Page titles and the header say so; nothing else

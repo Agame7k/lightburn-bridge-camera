@@ -36,7 +36,8 @@ GitHub Actions runs the tests on Python 3.7 (the Bridge's version) and 3.12. Pus
 |---|---|
 | `lbcam_stream.py` | camera server, dashboard API, updater |
 | `dashboard.html` | dashboard UI (single file, no build step) |
-| `placeholder.jpg` | "Camera not connected" image |
+| `placeholder.jpg` | "Camera not connected" image (animated live dot + timer) |
+| `make_placeholder.py` | rebuilds `placeholder.jpg` with its live layout (needs Pillow, dev only) |
 | `launcher.py` | runs the current release, health-checks updates, rolls back |
 | `lbcam.service` | systemd unit |
 | `patch_image.py` | adds lbcam to a Bridge `.img`/`.img.xz` offline |

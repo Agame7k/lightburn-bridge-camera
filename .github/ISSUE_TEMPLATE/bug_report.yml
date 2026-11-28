@@ -1,0 +1,39 @@
+name: Bug report
+description: Something doesn't work as described
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Shown in the page header (e.g. v3.4).
+    validations:
+      required: true
+  - type: input
+    id: bridge
+    attributes:
+      label: Bridge image
+      placeholder: LightBurnBridge v1.0-RC4
+  - type: input
+    id: controller
+    attributes:
+      label: Laser controller
+      placeholder: Ruida RDC6442G
+  - type: input
+    id: camera
+    attributes:
+      label: Camera
+      placeholder: Model, resolution and frame rate
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: From the log viewer on the Setup page, or `sudo journalctl -u lbcam -n 200`. For job drawing problems, attach the file from **Download raw**.
+      render: text

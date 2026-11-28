@@ -3,6 +3,11 @@
 Versions are the `VERSION` in `lbcam_stream.py` and the name of the update file
 (`lbcam-update-<version>.tar.gz`). Newest first.
 
+## Unreleased
+
+- The project is now called **BridgeDeck**. Page titles and the header say so; nothing else
+  changes (the service, files and update files are still `lbcam`).
+
 ## 3.4 (2026-11-27)
 
 - **Current Position jobs** (LightBurn's *Start From: Current Position*) can be framed: the

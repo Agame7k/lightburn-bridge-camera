@@ -7,7 +7,7 @@
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-title" content="Laser">
 <meta name="theme-color" content="#1d2024">
-<title>Bridge Camera</title>
+<title>BridgeDeck</title>
 <style>
 :root{
   --bg:#f4f5f7; --panel:#fff; --line:#e1e4e8; --text:#1d2025; --muted:#6a717c;
@@ -164,7 +164,7 @@ a.button{font:inherit;padding:8px 12px;border-radius:7px;border:1px solid var(--
 </head>
 <body>
 <header>
-  <h1>Bridge Camera</h1><span class="ver" id="ver"></span>
+  <h1>BridgeDeck</h1><span class="ver" id="ver"></span>
   <nav class="tabs"><a href="/" id="navSetup">Setup</a><a href="/monitor" id="navMonitor">Monitor</a><a href="/control" id="navControl">Control</a></nav>
   <span class="spacer"></span>
   <button id="soundBtn" title="Play a sound for job and laser alerts">🔕</button>
@@ -1004,7 +1004,7 @@ $("#setupView").hidden = VIEW !== "setup";
 $("#monitorView").hidden = !MONITOR;
 $("#controlView").hidden = !CONTROL;
 $({setup: "#navSetup", monitor: "#navMonitor", control: "#navControl"}[VIEW]).classList.add("on");
-document.title = {setup: "Bridge Camera", monitor: "Bridge Monitor", control: "Laser Control"}[VIEW];
+document.title = {setup: "BridgeDeck", monitor: "Monitor · BridgeDeck", control: "Control · BridgeDeck"}[VIEW];
 poll();
 if (MONITOR) {
   // left open for hours: stream only while the tab is visible, so the camera can pause otherwise

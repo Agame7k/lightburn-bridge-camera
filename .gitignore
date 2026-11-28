@@ -21,3 +21,6 @@ lbcam-update-*.tar.gz.sha256
 net_pending.json
 net_pending.json.tmp
 jobs/
+
+# Claude Code local files
+.claude/

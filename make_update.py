@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Build an update file for the Bridge camera dashboard.
+Build an update file for BridgeDeck (the lbcam service on the LightBurn Bridge).
 
   python3 make_update.py            -> lbcam-update-<version>.tar.gz
                                        lbcam-update-<version>.tar.gz.sha256

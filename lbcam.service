@@ -1,5 +1,5 @@
 [Unit]
-Description=LightBurn Bridge USB camera stream + dashboard
+Description=BridgeDeck: camera, monitor and remote for the LightBurn Bridge
 After=network.target
 
 [Service]

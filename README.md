@@ -1,363 +1,148 @@
-# LightBurn Bridge Camera
+<div align="center">
 
-Use a USB camera plugged into a **LightBurn Bridge** as a network camera in LightBurn.
-That covers camera overlay, Print and Cut, alignment, and the rest.
+# BridgeDeck
 
+**Camera, live job monitor and phone remote for the LightBurn Bridge.**
+
+Plug a USB camera into the Bridge and use it in LightBurn over WiFi, then watch and steer
+your laser from any phone or browser on the network.
+
+[![CI](https://github.com/Agame7k/lightburn-bridge-camera/actions/workflows/ci.yml/badge.svg)](https://github.com/Agame7k/lightburn-bridge-camera/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/Agame7k/lightburn-bridge-camera?sort=semver)](https://github.com/Agame7k/lightburn-bridge-camera/releases)
+![Python 3.7+](https://img.shields.io/badge/python-3.7%2B-3776AB?logo=python&logoColor=white)
+![Zero dependencies](https://img.shields.io/badge/dependencies-none-brightgreen)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+
+[Quick start](#quick-start) · [Features](#features) · [Docs](#documentation) · [Changelog](CHANGELOG.md)
+
+</div>
+
+> [!NOTE]
+> **Unofficial.** Not affiliated with or endorsed by LightBurn Software. It runs as a separate
+> service next to the Bridge's own software and doesn't modify LightBurn's code. LightBurn's
+> Bridge image is not included; you patch your own copy.
+
+<!--
+Screenshots: put PNGs in docs/images/ and uncomment.
+<p align="center">
+  <img src="docs/images/monitor.png" width="62%" alt="Monitor page">
+  <img src="docs/images/control.png" width="26%" alt="Control page on a phone">
+</p>
+-->
+
+```mermaid
+flowchart LR
+    cam[USB camera] --> bridge
+    subgraph bridge [LightBurn Bridge]
+        lbcam["lbcam :8080"]
+        relay[LightBurn relay]
+    end
+    lbcam -- "MJPEG stream" --> lb[LightBurn]
+    lb -- jobs --> relay -- Ethernet --> laser[Ruida controller]
+    lbcam -. "status, pause / stop, jog, frame" .-> laser
+    lbcam -- "monitor / control pages" --> phone[Phone or browser]
 ```
-USB camera ─▶ LightBurn Bridge (lbcam, port 8080) ─WiFi─▶ LightBurn "network camera"
-```
-
-> **Unofficial.** Not affiliated with or endorsed by LightBurn Software. It adds a
-> separate service next to the Bridge's own software and doesn't modify LightBurn's code.
-> LightBurn's Bridge image is not included. You patch your own copy.
 
 ## Features
 
-- **MJPEG stream + snapshot URLs** that LightBurn's network camera option accepts.
-- **Monitor page** at `http://<bridge-ip>:8080/monitor`, made to be left open (e.g. on a
-  phone or tablet next to the laser):
-  - live camera (the stream pauses while the tab is hidden, so the camera can idle)
-  - job status from the controller: running/idle, progress, elapsed time, last job's duration
-  - head position, machine counters (power-on, work and laser-on hours, job count), model
-  - laser connection: Ethernet link, whether the controller answers, LightBurn relay status
-  - Bridge health: CPU temperature, under-voltage/throttling, load
-  - laser buttons: **Pause / Resume / Stop** during a job (Resume asks for confirmation, and for
-    the update password when one is set, because it makes the laser fire again)
-  - **Home**, **Go to origin** and **Frame** / **Outline frame** while the laser is idle: the same laser-off
-    moves LightBurn sends, built on the Bridge. Stop also cancels a frame or move.
-  - **"Laser isn't firing" warning** when a job has run 20 s without the laser-on counter
-    moving: usually an alarm on the panel such as Water Prot (the water alarm itself can't be
-    read from the controller)
-  - **job file view**: a drawing of the job LightBurn sent, by layer colour, with the done part
-    and the laser head marked while it runs, plus the last 10 jobs and how each run ended
-    (see [Job capture](#job-capture))
-  - reloads itself after a software update
-- **Alerts on the page** (setup and monitor): job started / paused / resumed / finished /
-  stopped at N%, laser disconnected / connected, camera unplugged / plugged in, Bridge hot or
-  under-voltage. Important ones stay until dismissed; a hidden tab shows a count in its title.
-  Optional sound (bell button in the header).
-- **Control page** at `http://<bridge-ip>:8080/control`, made for a phone next to the laser:
-  - big status (Idle / Running / Paused / Held / Moving), progress, head X/Y and the bed size
-  - jog pad with diagonals, distance (0.1 / 1 / 10 / 50 / 100 mm or any value) and speed,
-    like LightBurn's Move window; **Move to** X/Y; **Home** and **Go to origin**
-  - the job drawing with **Frame** / **Outline frame**, and recent jobs
-  - **Stop** and **Pause / Resume** always at the bottom of the screen
-  - every move is laser-off, limited to the bed (read from the controller), and can be stopped;
-    optional camera; can be added to the phone's home screen
-- **Setup page** at `http://<bridge-ip>:8080/`:
-  - live preview, status, measured fps, viewer count
-  - camera picker, resolution and frame rate dropdowns showing what the camera actually supports
-  - image controls (exposure, focus, white balance, …), applied live and saved per camera
-  - copyable URLs for LightBurn
-  - log viewer (the service journal), static IP settings, software updates
-- **Handles a missing camera**: while no camera is working, LightBurn gets a
-  "Camera not connected" image instead of a dead stream. Live video returns automatically
-  when one is plugged in. Errors are explained in the dashboard.
-- **Starts at boot**, survives crashes and camera unplug/replug.
-- **Pauses the camera when nobody is watching** (after 30 s, `CAM_IDLE_SECONDS`; `0`
-  turns it off). The next stream or snapshot request wakes it up in about a second.
-- **Updates in the field**: upload an update file in the dashboard. Each update is
-  self-tested on the Bridge, health-checked after restart, and **rolled back automatically**
-  if it fails. Optional update password.
-- **No dependencies**: pure Python 3.7 standard library (V4L2 via `ioctl` + `mmap`), so it
-  runs on the stock Bridge image as-is. The camera's MJPEG frames are passed through, so CPU
-  use is tiny.
+### 📷 Network camera for LightBurn
+- **MJPEG stream and snapshot URLs** that LightBurn's network camera option accepts, so
+  overlay, Print and Cut and alignment all work.
+- **Setup page** with live preview, camera / resolution / frame-rate pickers that show what the
+  camera really supports, and image controls (exposure, focus, white balance…) saved per camera.
+- Serves a *Camera not connected* image instead of a dead stream, and recovers on its own
+  when the camera is plugged back in. Idles the camera when nobody is watching.
 
-## Requirements
+### 📊 Monitor page — leave it open next to the laser
+- Job status straight from the controller: running / paused / idle, progress, elapsed time,
+  head position, machine counters and hours.
+- **Job drawing**: the file LightBurn sent, drawn by layer colour, with the finished part and the
+  laser head marked live. The last 10 jobs and how each run ended.
+- **Alerts** for job started / finished / stopped at N%, laser or camera disconnected, Bridge
+  hot or under-voltage, and *laser isn't firing* (usually a water or door alarm).
+- Bridge health: CPU temperature, throttling, load.
 
-- A LightBurn Bridge (Raspberry Pi based). Tested with the **v1.0-RC4** image.
-- A USB **UVC camera with MJPEG output**. Nearly all cameras sold for LightBurn qualify.
-- LightBurn with network camera support.
-- To build an image: Linux with `debugfs` / `e2fsck` (package `e2fsprogs`) and Python 3.
+### 🎮 Control page — your phone as a pendant
+- Jog pad with diagonals, step sizes and speed like LightBurn's Move window, **Move to X/Y**,
+  **Home**, **Go to origin**, **Frame** and **Outline frame**.
+- **Pause / Resume / Stop** always within thumb reach.
+- Every move is laser-off, limited to the bed size read from the controller, and stoppable.
+  There is deliberately no way to start a job or fire the laser.
 
-## Install
+### 🔧 Built to be left alone
+- **No dependencies**: pure Python 3.7 standard library, runs on the stock Bridge image.
+- Starts at boot and survives crashes and camera unplugs.
+- **Safe updates from the browser**: each update self-tests on the Bridge, is health-checked
+  after restart and **rolls back automatically** if it fails. Optional update password.
+- Static IP for the Bridge's WiFi, with a 90-second "keep these settings?" safety net.
 
-### Option A: patch the Bridge image and flash it
+## Quick start
 
-1. Download the Bridge image from LightBurn (e.g. `LightBurnBridge-v1.0-RC4.img.xz`).
-2. Patch it (no root needed, the original is left untouched):
-   ```
-   python3 patch_image.py LightBurnBridge-v1.0-RC4.img.xz LightBurnBridge-camera.img
-   ```
-3. Flash `LightBurnBridge-camera.img` with Raspberry Pi Imager (*Use custom*), then set the
-   Bridge up as usual.
+**You need:** a LightBurn Bridge (tested with the **v1.0-RC4** image), a USB **UVC camera with
+MJPEG output** (nearly every camera sold for LightBurn), and LightBurn with network camera support.
 
-### Option B: install on a running Bridge over SSH
+### 1. Install
 
+**Option A — patch the Bridge image and flash it** (Linux, needs `e2fsprogs` and Python 3; no root):
+
+```bash
+python3 patch_image.py LightBurnBridge-v1.0-RC4.img.xz LightBurnBridge-camera.img
 ```
+
+Flash `LightBurnBridge-camera.img` with Raspberry Pi Imager (*Use custom*), then set the Bridge up
+as usual. The original image is left untouched.
+
+**Option B — install on a running Bridge over SSH:**
+
+```bash
 ./upgrade_over_ssh.sh <bridge-ip>
 ```
 
-Asks for the Bridge's SSH password once (stock image: user `pi`, see [Security](#security)).
+Asks for the Bridge's SSH password once (stock image: user `pi` — please change it, see
+[Security](SECURITY.md)).
 
-## Connect LightBurn
+### 2. Connect LightBurn
 
-In LightBurn's camera settings choose a network camera and enter:
+In LightBurn's camera settings choose a **network camera** and enter:
 
-- MJPEG stream: `http://lightburnbridge.local:8080/stream` (recommended)
-- Snapshot: `http://lightburnbridge.local:8080/snapshot.jpg`
+| | URL |
+|---|---|
+| MJPEG stream (recommended) | `http://lightburnbridge.local:8080/stream` |
+| Snapshot | `http://lightburnbridge.local:8080/snapshot.jpg` |
 
-The `.local` name keeps working if the Bridge's IP changes (macOS supports it out of the
-box; on Windows/Linux it needs mDNS/Bonjour). Otherwise use the IP: `http://<bridge-ip>:8080/stream`.
+The `.local` name survives IP changes (built into macOS; Windows/Linux need mDNS/Bonjour).
+Otherwise use `http://<bridge-ip>:8080/stream`. Then run *Calibrate Camera Lens* and
+*Align Camera* — and again whenever you change camera or resolution.
 
-Then run *Calibrate Camera Lens* and *Align Camera*. Redo both after changing camera or
-resolution.
+### 3. Open the pages
 
-## Static IP
+| Page | URL | For |
+|---|---|---|
+| Setup | `http://lightburnbridge.local:8080/` | camera settings, URLs, logs, network, updates |
+| Monitor | `http://lightburnbridge.local:8080/monitor` | watching a job |
+| Control | `http://lightburnbridge.local:8080/control` | jogging and framing from a phone (add it to your home screen) |
 
-Dashboard → **Network** sets the Bridge's **WiFi** address to DHCP or a static IP. The
-laser's Ethernet link isn't touched.
-
-- Input is validated: subnet, gateway inside the subnet, not the laser's subnet, and a ping
-  check that the address isn't already in use.
-- After **Apply** the page opens the new address. You have **90 seconds** to press
-  **Keep settings** there, otherwise the previous settings are restored automatically. This
-  also works across a crash or reboot.
-- Choose an address outside your router's DHCP range. A DHCP reservation in the router is an
-  equally good alternative.
-- If the Bridge is later set up for a different WiFi network (LightBurn's `wifi.txt`), it
-  goes back to DHCP.
-
-## Updating
-
-What changed in each version: [CHANGELOG.md](CHANGELOG.md).
-
-1. Change the code and bump `VERSION` in `lbcam_stream.py`.
-2. `python3 make_update.py` → `lbcam-update-<version>.tar.gz` plus
-   `lbcam-update-<version>.tar.gz.sha256` (the file's SHA-256, `sha256sum` format).
-3. Dashboard → **Software** → choose the file → **Install update**.
-4. Optional: compare **Software → File SHA-256** with the `.sha256` file to confirm the
-   Bridge got exactly the file you built (`sha256sum -c lbcam-update-*.sha256` checks your copy).
-
-From a script, send the expected hash and the Bridge refuses the file if it doesn't match:
-
-```
-curl -X POST -H 'X-LBCam: 1' -H "X-Sha256: $(cut -d' ' -f1 lbcam-update-2.6.tar.gz.sha256)" \
-     --data-binary @lbcam-update-2.6.tar.gz http://lightburnbridge.local:8080/api/update
-```
-
-What happens:
-
-1. Checks: file list, SHA-256 checksums, version string, and the password if one is set.
-2. The new version runs `--selftest` **on the Bridge** (Python version, V4L2 struct
-   sizes, assets). If it fails, nothing changes.
-3. It's unpacked to `/opt/lbcam/releases/<version>`, `current` is switched, and the app restarts.
-4. The launcher waits up to 45 s for the new version to report itself on `/status`. If it
-   crashes or doesn't answer, the launcher switches back and the dashboard shows why.
-5. **Roll back** returns to the previous version at any time. The last 3 releases are kept.
-
-Only `lbcam_stream.py`, `dashboard.html` and `placeholder.jpg` can be updated by upload.
-`launcher.py` and the service change only via SSH or reflash, so an upload can't break rollback.
-
-## On the Bridge
-
-```
-/opt/lbcam/launcher.py                 stable launcher (health check + rollback)
-/opt/lbcam/current -> releases/<ver>   running version
-/opt/lbcam/previous -> releases/<ver>  rollback target
-/opt/lbcam/releases/<ver>/             lbcam_stream.py, dashboard.html, placeholder.jpg
-/opt/lbcam/last_update.json            result of the last update
-/etc/systemd/system/lbcam.service      starts the launcher at boot
-/boot/lbcam.json                       settings (FAT partition, editable from any computer)
-/boot/lbcam.env                        optional env overrides (CAM_WIDTH, CAM_FPS, CAM_PORT, …)
-```
-
-```
-sudo systemctl status lbcam
-sudo journalctl -u lbcam -f
-```
-
-## API
+## Documentation
 
 | | |
 |---|---|
-| `GET /stream` | MJPEG stream |
-| `GET /snapshot.jpg` | single JPEG |
-| `GET /status` | version, state, message, camera, fps, viewers |
-| `GET /api/state` | everything the dashboard shows |
-| `GET /api/cameras` | detected cameras |
-| `GET /api/modes?device=<id>` | MJPEG resolutions + frame rates |
-| `GET /api/controls` | image controls with ranges and current values |
-| `POST /api/config` | `{"device","width","height","fps"}`: saves and restarts the camera |
-| `POST /api/control` | `{"id","value"}` |
-| `POST /api/controls/reset` | camera defaults, clears saved values |
-| `POST /api/restart` | reopen the camera |
-| `GET /api/update` | version, previous version, installed file's SHA-256, last update result |
-| `POST /api/update` | update file as the body (`X-Password` if a password is set, optional `X-Sha256`) |
-| `POST /api/update/rollback` | `{"password"}` |
-| `POST /api/update/password` | `{"current","new"}`. An empty `new` removes the password |
-| `GET /api/network` | WiFi connection, address, mode, pending change |
-| `POST /api/network` | `{"mode":"dhcp"}` or `{"mode":"static","address","prefix","gateway","dns"}` |
-| `POST /api/network/confirm` | keep a pending change |
-| `POST /api/network/revert` | undo a pending change now |
-| `GET /api/logs?n=200` | recent log lines |
-| `GET /api/laser` | laser connection check plus controller status under `controller` (`?fresh=1` skips the 5 s cache) |
-| `GET /api/jobs` | captured jobs (newest first, with their runs), the job being received (`live`), the job running now (`running`) and the capture state |
-| `GET /api/jobs/<id>.rd` | a captured job as plain (unswizzled) Ruida bytes; `live.rd` is the one still being received |
-| `POST /api/jobs/clear` | delete all captured jobs |
-| `POST /api/laser/record` | `{"seconds": 30}` (5–120): record LightBurn ↔ laser traffic, decoded (diagnostics) |
-| `GET /api/laser/record` | the recording: packets with time, direction and commands; status polls and ACKs only counted |
-| `GET /api/health` | Bridge CPU temperature, power/throttling flags, load, uptime |
-| `POST /api/laser/scan` | `{"start": "0x200", "count": 256}`. Diagnostic: reads a range of controller memory (idle only, read-only, at most 512 addresses; stops early if the laser gets busy) |
-| `POST /api/laser/home` | LightBurn's Home, byte for byte (laser off, head to 0, 0; idle only) |
-| `POST /api/laser/jog` | `{"dx","dy"}` (relative) or `{"x","y"}` (absolute) in mm, optional `"speed"` mm/s (1–300): laser-off move inside the bed; jogs stop at the edge |
-| `POST /api/laser/origin` | move the head to the origin stored in the controller (laser off; idle only) |
-| `POST /api/laser/frame` | `{"job": "<id>", "kind": "box" \| "outline"}`: trace a captured job's bounding box or outline (laser off; idle only; absolute-placed jobs only), then return |
-| `POST /api/laser/command` | `{"cmd": "pause" \| "resume" \| "stop"}`. `resume` also needs `"password"` when the update password is set |
+| [Laser control and job capture](docs/laser.md) | what each button sends, how status is read, how jobs are captured and framed |
+| [Updates and rollback](docs/updates.md) | building and installing updates, where files live on the Bridge |
+| [Static IP](docs/static-ip.md) | giving the Bridge a fixed WiFi address |
+| [HTTP API](docs/api.md) | every endpoint, for scripting |
+| [Troubleshooting](docs/troubleshooting.md) | what the messages on each page mean |
+| [Contributing](CONTRIBUTING.md) | running it locally, tests, project layout |
+| [Security](SECURITY.md) | threat model and reporting vulnerabilities |
 
-Every `POST` needs the header `X-LBCam: 1`, and an `Origin` header (if sent) must match the
-Bridge's address. That stops other websites from changing settings through your browser.
-Requests must use the Bridge's IP, `localhost` or a `.local` name; add other names to
-`CAM_ALLOWED_HOSTS` (comma-separated) in `/boot/lbcam.env`.
+## Compatibility
 
-```
-curl -X POST -H 'X-LBCam: 1' http://lightburnbridge.local:8080/api/restart
-```
-
-## Development
-
-Runs on any Linux machine with a UVC webcam:
-
-```
-python3 lbcam_stream.py              # http://localhost:8080, settings in ./lbcam.json
-python3 lbcam_stream.py --selftest
-python3 -m unittest discover -s tests -v   # no camera needed
-python3 make_update.py                     # builds lbcam-update-<version>.tar.gz
-```
-
-Without a laser, point the controller reader at a Ruida emulator (MeerK40t has one) with
-`LBCAM_RUIDA_DIRECT=host:port`; that skips the network namespace.
-
-GitHub Actions runs the tests on Python 3.7 (the Bridge's version) and 3.12. Pushing a tag
-`v<VERSION>` (e.g. `v2.5`) builds the update file and attaches it to a GitHub release.
-
-## Project layout
-
-| File | Purpose |
+| | Status |
 |---|---|
-| `lbcam_stream.py` | camera server, dashboard API, updater |
-| `dashboard.html` | dashboard UI (single file, no build step) |
-| `placeholder.jpg` | "Camera not connected" image |
-| `launcher.py` | runs the current release, health-checks updates, rolls back |
-| `lbcam.service` | systemd unit |
-| `patch_image.py` | adds lbcam to a Bridge `.img`/`.img.xz` offline |
-| `make_update.py` | builds an update file |
-| `upgrade_over_ssh.sh` | installs onto a running Bridge over SSH |
-| `tests/` | unit tests (standard library `unittest`) |
-
-## Troubleshooting
-
-| Dashboard says | Fix |
-|---|---|
-| No USB camera detected | Plug in a UVC camera; try another cable/port; avoid unpowered hubs. |
-| … does not support MJPEG | The camera is YUYV-only; use an MJPEG-capable camera. |
-| … is in use by another program | Restart camera, or reboot the Bridge. |
-| No frames from camera for 3 s | Usually power or cable. Retries automatically. |
-| Paused | Nobody is watching; it wakes on the next request. Not an error. |
-| Camera chose W×H | The camera doesn't support the requested size; pick one from the list. |
-
-| Monitor says | Fix |
-|---|---|
-| No cable | Ethernet from the Bridge to the controller is unplugged, or the laser is off. |
-| Not answering | Link is up but nothing answers at the laser IP. The controller's IP (set on the laser's panel) must match the Bridge's laser IP, 10.0.3.3 by default. |
-| Relay stopped / Relay error | LightBurn's relay service. Restart the Bridge; the message shows what it reported. |
-| Controller status: … | The status reader couldn't start or get replies; the text says why. |
-
-### Laser buttons
-
-| Button | Sends | Allowed when |
-|---|---|---|
-| Pause | `D8 02` | a job is running |
-| Resume | `D8 03` | a job is paused |
-| Stop | `D8 01` | a job is running or paused (asks first) |
-
-All three are verified on an RDC6442G. Two others were tried and removed: `D8 2A`
-("Home XY" in MeerK40t) **reset the controller** (it rebooted and re-homed), and the panel's
-Frame key (`A5 53 00`) was acknowledged but ignored on port 50200.
-
-The Bridge enforces these rules itself, not just the page. Each command waits for the
-controller's acknowledgement and is never resent if none arrives, so it can't run twice.
-Every command is logged with the address it came from. There is deliberately no way to
-start a job or fire the laser from the Bridge.
-
-### How the laser status works
-
-Status reading is read-only:
-
-- **Connection:** Ethernet link state, a ping to the controller (or its ARP entry if ping is
-  blocked), and LightBurn's relay status files in `/mnt/lbproc`.
-- **Controller status** (Ruida): memory reads over the controller's UDP protocol, the same
-  kind LightBurn makes constantly. The controller always replies to UDP port 40200, which
-  LightBurn's relay also uses, so the reader runs in its own network namespace (`lbcam`)
-  with its own address on the laser link (`10.0.3.254`, change with `LBCAM_RUIDA_IP`). Its
-  port 40200 is separate, so the relay never sees our traffic. Polls every 2 s while the
-  monitor is open, every 20 s otherwise. Turn it off with `LBCAM_RUIDA=0` in `/boot/lbcam.env`.
-
-The protocol details come from the open-source [MeerK40t](https://github.com/meerk40t/meerk40t)
-Ruida driver and were checked on an RDC6442G: status bit 0 = job running, bit 1 (with bit 0) =
-paused; job progress = file progress ÷ file total; the job counter only goes up for finished
-jobs, which is how "finished" and "stopped at N%" are told apart. Jogging from the panel
-doesn't change the status bits, so "Moving" comes from the head position changing; moves
-without a job file don't count as jobs. With the door open or a water fault the controller holds
-a job ("Machine protected" on its panel) at the jog bits `0x10603` with the head still, which is
-shown as **Held**; the door and water inputs themselves can't be read. Hour counters are in seconds, the controller's previous job time in milliseconds. Other
-models may differ; `/api/laser` includes the raw values under `controller.raw` for checking.
-
-Head moves were recorded from LightBurn on an RDC6442G with **Record laser traffic**. Go to
-origin is `C9 02` (speed 100 mm/s), `C6 01`/`C6 21` (power 0), then `D9 10 00 <x> <y>`, a
-laser-off rapid move to absolute µm. The origin it goes to is stored in the controller at
-`0x0224`/`0x0234` (X/Y) and again at `0x0229`/`0x0239`; the Bridge refuses to move if the two
-copies disagree. A frame is the same moves around the outline, at 100 mm/s with all four power
-settings at 0. `D8 01` (Stop) cancels a frame that is still being sent. MeerK40t's "Home XY"
-(`D8 2A`) is deliberately not used: it reset this controller.
-
-The bed size comes from the axis settings: X travel at `0x0026` and Y travel at `0x0036` (read
-700000 / 500000 µm on a 700 × 500 mm machine). Jog and Move to are the same laser-off `D9` moves
-at the chosen speed (`C9 02`), never outside 0 to travel; Home is LightBurn's recorded bytes,
-sent as-is.
-
-### Job capture
-
-LightBurn's relay sends each job to the controller over the Bridge's Ethernet port. lbcam
-copies those packets with a read-only packet socket on `eth0`. It never sends anything, so
-neither the relay nor the laser notices. Resent packets are kept once, LightBurn's status
-polls are left out, and a job ends at the Ruida end-of-file command (or after 10 s without
-data). Streams without a single cut (framing, jogging) aren't kept.
-
-- Jobs are stored in `/opt/lbcam/jobs` (the last 10; change the folder with `LBCAM_JOBS_DIR`)
-  as plain Ruida bytes. The dashboard decodes and draws them; the Bridge doesn't.
-- A run is matched to the job captured up to 10 minutes before it started. Jobs started from
-  files stored on the laser's panel can't be shown unless they were sent while lbcam was running.
-- The drawing's done part comes from the controller's progress, so it's approximate. If it's
-  mirrored compared to the bed, or the jog arrows go the wrong way, turn on **Flip X** / **Flip Y**
-  under *Machine direction* on the Setup page (saved on the Bridge, for every device).
-- Turn it off with `LBCAM_JOBS=0` in `/boot/lbcam.env`.
-- **Frame** and **Outline frame** trace the shown job's bounding box or the outline around its
-  cuts (its convex hull, like LightBurn's rubber-band frame) at 100 mm/s with laser power set
-  to 0, then return the head to where it was. Works for LightBurn's *Start From: Absolute Coords*
-  (the job header must match its cuts) and *Current Position* (placed from where the head is
-  when you press Frame, refused if any of it would leave the bed), only while idle. *User Origin*
-  jobs are drawn but can't be framed yet. The job file says which: `D8 10` absolute, `D8 11`
-  user origin, `D8 12` current position.
-- If a job draws wrong, **Download raw** saves exactly what was captured, for a bug report.
-- **Record laser traffic** (setup page) records everything LightBurn and the controller send
-  each other for 30 s, decoded into commands. Use it to see what a LightBurn button sends.
-
-Laggy or choppy: lower resolution or frame rate. Weak WiFi is the usual cause.
-
-## Security
-
-- Intended for a trusted local network. The stream and camera settings are open to anyone
-  on the network. Software updates and resuming a paused job can be protected with the optional
-  update password (Pause and Stop never need it).
-- Captured jobs (your designs) can be viewed and downloaded by anyone on the network, like
-  the camera. Clear them from the monitor page, or turn capture off with `LBCAM_JOBS=0`.
-- The API refuses cross-site requests and unknown host names (CSRF and DNS-rebinding
-  protection), so a web page you visit can't change the Bridge's settings.
-- **The stock Bridge image has SSH enabled with the default Raspberry Pi login and
-  passwordless sudo.** Change it with `ssh pi@<bridge-ip> passwd`. That comes from the
-  stock image, not from this project.
+| Bridge image v1.0-RC4 | ✅ tested |
+| Ruida RDC6442G | ✅ status, pause / resume / stop, jog, home, origin, frame verified |
+| Other Ruida controllers | 🟡 probably; `/api/laser` shows the raw values — please [report](https://github.com/Agame7k/lightburn-bridge-camera/issues/new/choose) |
+| Non-Ruida controllers | ❌ camera works, laser features don't |
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+[MIT](LICENSE). LightBurn is a trademark of LightBurn Software, LLC.

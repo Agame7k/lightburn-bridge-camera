@@ -47,7 +47,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "3.1"
+VERSION = "3.4"
 LBCAM_HOME = os.environ.get("LBCAM_HOME", "/opt/lbcam")
 
 # ======================================================================== V4L2
@@ -1251,6 +1251,9 @@ MEM_SLOW = (0x0201, 0x0202, 0x0205, 0x02FE, 0x0224, 0x0234, 0x0229, 0x0239, 0x00
 STATUS_BUSY, STATUS_PAUSED, STATUS_MANUAL = 0x01, 0x02, 0x200
 FILE_TOTAL_UNKNOWN = 1000000000  # reported while framing / no job loaded
 MOVING_HOLD = 3.0  # s: show "moving" this long after the last position change
+# "Machine protected, work paused" (door open, Water Prot) on an RDC6442G: the controller takes the
+# job and sits at 0x10603 - the same bits as a jog - with the head still. Not readable anywhere else.
+HELD_AFTER = 3.0  # s of jog bits with a still head (and no move of ours) before calling it held
 # A job that has been running (not paused) this long without the laser-on counter moving is
 # probably blocked by an alarm. Water protection, for example, isn't readable from the controller.
 NOT_FIRING_AFTER = 20.0
@@ -1264,7 +1267,7 @@ NOT_FIRING_AFTER = 20.0
 RUIDA_COMMANDS = {
     "pause":  (b"\xD8\x02", ("running",)),
     "resume": (b"\xD8\x03", ("paused",)),
-    "stop":   (b"\xD8\x01", ("running", "paused", "moving")),
+    "stop":   (b"\xD8\x01", ("running", "paused", "moving", "held")),
 }
 RUIDA_ACK, RUIDA_NAK = 0xCC, 0xCF
 SEND_WAIT = 1.0  # s to wait for the ACK of one command packet
@@ -1499,20 +1502,36 @@ def _rel14(b):
     return v - 0x4000 if v >= 0x2000 else v
 
 
-def ruida_job_geometry(data):
-    """Cut endpoints of a job (µm), their bounds, and whether it is placed absolutely.
+# LightBurn's Start From, as the job's reference point mode (D8 10 / 11 / 12; MeerK40t's names
+# "machine zero", "anchor point", "current position"). Checked on an RDC6442G: Absolute Coords
+# sends D8 10, Current Position D8 12.
+JOB_PLACEMENT = {0x10: "absolute", 0x11: "origin", 0x12: "current"}
 
-    "Absolute" (LightBurn's Start From: Absolute Coords) means: the header's top-left (E7 03)
-    and bottom-right (E7 07) are present, match the cuts, and an absolute move comes before the
-    first cut. Only then do the file's coordinates say where the job lands on the bed."""
+
+def job_coord(b):
+    """A coordinate in a job file (µm). LightBurn writes negative ones as 32-bit two's complement
+    inside the 35-bit field (-279.4 mm arrives as 4294687896), so read those as negative."""
+    v = decode35(b)
+    return v - (1 << 32) if (1 << 31) <= v < (1 << 32) else v
+
+
+def ruida_job_geometry(data):
+    """Cut endpoints of a job (µm), their bounds, and how it is placed.
+
+    placement: "absolute" (Start From: Absolute Coords, the file's coordinates are bed positions),
+    "current" (Current Position: relative to where the head is when it starts), "origin" (User
+    Origin) or None. "absolute" is only True when the header's top-left (E7 03) and bottom-right
+    (E7 07) are present and match the cuts and an absolute move comes before the first cut."""
     x = y = 0
-    pts, header, abs_seen, abs_first = set(), {}, False, None
+    pts, header, abs_seen, abs_first, placement = set(), {}, False, None, None
     for m in _RUIDA_TOKEN.finditer(data):
         t = m.group()
         c, p = t[0], t[1:]
         nx = None
-        if c == 0x88 and len(p) >= 10:
-            x, y, abs_seen = decode35(p[:5]), decode35(p[5:10]), True
+        if c == 0xD8 and p[:1] and p[0] in JOB_PLACEMENT and placement is None:
+            placement = JOB_PLACEMENT[p[0]]
+        elif c == 0x88 and len(p) >= 10:
+            x, y, abs_seen = job_coord(p[:5]), job_coord(p[5:10]), True
         elif c == 0x89 and len(p) >= 4:
             x, y = x + _rel14(p), y + _rel14(p[2:])
         elif c == 0x8A and len(p) >= 2:
@@ -1520,7 +1539,7 @@ def ruida_job_geometry(data):
         elif c == 0x8B and len(p) >= 2:
             y += _rel14(p)
         elif c == 0xA8 and len(p) >= 10:
-            nx, ny, abs_seen = decode35(p[:5]), decode35(p[5:10]), True
+            nx, ny, abs_seen = job_coord(p[:5]), job_coord(p[5:10]), True
         elif c == 0xA9 and len(p) >= 4:
             nx, ny = x + _rel14(p), y + _rel14(p[2:])
         elif c == 0xAA and len(p) >= 2:
@@ -1528,7 +1547,7 @@ def ruida_job_geometry(data):
         elif c == 0xAB and len(p) >= 2:
             nx, ny = x, y + _rel14(p)
         elif c == 0xE7 and len(p) >= 11 and p[0] in (0x03, 0x07):
-            header[p[0]] = (decode35(p[1:6]), decode35(p[6:11]))
+            header[p[0]] = (job_coord(p[1:6]), job_coord(p[6:11]))
         if nx is not None:
             if abs_first is None:
                 abs_first = abs_seen
@@ -1536,12 +1555,16 @@ def ruida_job_geometry(data):
             pts.add((nx, ny))
             x, y = nx, ny
     if not pts:
-        return {"points": pts, "bounds": None, "absolute": False}
+        return {"points": pts, "bounds": None, "absolute": False, "placement": placement}
     xs, ys = [q[0] for q in pts], [q[1] for q in pts]
     bounds = (min(xs), min(ys), max(xs), max(ys))
     hb = (header[3] + header[7]) if 3 in header and 7 in header else None
-    absolute = bool(abs_first and hb and all(abs(a - b) <= 1000 for a, b in zip(hb, bounds)))
-    return {"points": pts, "bounds": bounds, "absolute": absolute}
+    fits = bool(abs_first and hb and all(abs(a - b) <= 1000 for a, b in zip(hb, bounds)))
+    if placement is None and fits:
+        placement = "absolute"  # no D8 1x seen (older captures, other software): judge by the header
+    absolute = fits and placement == "absolute"
+    return {"points": pts, "bounds": bounds, "absolute": absolute,
+            "placement": placement if placement != "absolute" or absolute else None}
 
 
 def convex_hull(points):
@@ -1568,9 +1591,11 @@ def frame_outline(geo, kind):
     """Points of a box or rubber-band ("outline") frame for a job geometry."""
     if not geo["bounds"]:
         raise RuidaCommandError("the job has no cuts to frame")
-    if not geo["absolute"]:
-        raise RuidaCommandError("the job isn't placed with absolute coordinates, so its position "
-                                "on the bed isn't known (LightBurn: Start From \"Absolute Coords\")")
+    if geo.get("placement") == "origin":
+        raise RuidaCommandError("jobs placed at the User Origin can't be framed from here yet")
+    if not geo["absolute"] and geo.get("placement") != "current":
+        raise RuidaCommandError("the job's position on the bed isn't known (LightBurn: Start From "
+                                "\"Absolute Coords\" or \"Current Position\")")
     x0, y0, x1, y1 = geo["bounds"]
     if kind == "box":
         return [(x0, y0), (x0, y1), (x1, y1), (x1, y0), (x0, y0)]
@@ -1661,6 +1686,8 @@ class Ruida:
         self.recheck_until = 0.0
         self.first_u, self.u_moved = None, False
         self.last_pos, self.moved_at = None, 0.0
+        self.held_since = None  # jog bits seen with the head still since then
+        self.idle_pos = None  # (x, y) µm while last idle: where a Current Position job starts from
         self.cmd = None  # {"name", "payload", "who", "done": Event, "result"}
         self.scan_job = None  # {"start", "count", "done": Event, "result"}
         self.cmd_lock = threading.Lock()
@@ -1929,12 +1956,25 @@ class Ruida:
             return [(p, None) for p in HOME_PACKETS], path_seconds([(cx, cy), (0, 0)])
         return self.move("home", build, who)
 
-    def frame(self, outline, who="?", label="frame"):
-        """Trace outline (µm points) and return to where the head was."""
+    def frame(self, outline, who="?", label="frame", from_head=False):
+        """Trace outline (µm points) and return to where the head was. from_head: the outline is
+        relative to the head (a Current Position job), and must stay on the bed."""
         def build(t, magic):
             cx, cy = self._read_all(t, magic, (0x0221, 0x0231))
-            pts = [(cx, cy)] + list(outline) + [(cx, cy)]
-            return frame_packets(outline, (cx, cy)), path_seconds(pts)
+            pts_out = list(outline)
+            if from_head:
+                bx, by = self._bed(t, magic)
+                pts_out = [(cx + x, cy + y) for x, y in outline]
+                xs, ys = [q[0] for q in pts_out], [q[1] for q in pts_out]
+                if min(xs) < 0 or min(ys) < 0 or max(xs) > bx or max(ys) > by:
+                    raise RuidaCommandError(
+                        "from where the head is (%.1f, %.1f mm) the job would go off the bed "
+                        "(%.1f-%.1f x %.1f-%.1f mm on a %.0f x %.0f mm bed)"
+                        % (cx / 1000, cy / 1000, min(xs) / 1000, max(xs) / 1000, min(ys) / 1000,
+                           max(ys) / 1000, bx / 1000, by / 1000))
+            outline_here = pts_out
+            pts = [(cx, cy)] + outline_here + [(cx, cy)]
+            return frame_packets(outline_here, (cx, cy)), path_seconds(pts)
         return self.move(label, build, who)
 
     # ---- diagnostics: read a range of controller memory (read-only, same reads as status)
@@ -2069,12 +2109,23 @@ class Ruida:
                                      for a, b in zip(pos, self.last_pos)):
                 self.moved_at = now
             self.last_pos = pos
-            moving = not running and (busy or now - self.moved_at < MOVING_HOLD)
-            v["running"], v["paused"], v["moving"] = running, paused, moving
-            v["state"] = "paused" if paused else "running" if running else "moving" if moving else "idle"
+            jog_bits = busy and bool(st & STATUS_MANUAL) and bool(st & STATUS_PAUSED)
+            if not jog_bits or running or now - self.moved_at < HELD_AFTER or self.motion_busy():
+                self.held_since = None
+            elif self.held_since is None:
+                self.held_since = now
+            held = self.held_since is not None and now - self.held_since >= HELD_AFTER
+            if held and not self.values.get("held"):
+                log("laser held by the controller: machine protected (door open or water fault?)")
+            moving = not running and not held and (busy or now - self.moved_at < MOVING_HOLD)
+            v["running"], v["paused"], v["moving"], v["held"] = running, paused, moving, held
+            v["state"] = ("paused" if paused else "running" if running else "held" if held
+                          else "moving" if moving else "idle")
+            if v["state"] == "idle" and None not in pos[:2]:
+                self.idle_pos = pos[:2]
             if running:
                 if not self.job:
-                    self.job = {"start": now, "count0": count, "progress": None,
+                    self.job = {"start": now, "count0": count, "progress": None, "ref": self.idle_pos,
                                 "laser0": lt, "run_s": 0.0, "tick": now, "fired": False, "lt_last": lt,
                                 "lt_at": None}
                 job = self.job
@@ -2105,6 +2156,8 @@ class Ruida:
                 except Exception as e:
                     log("job history: %s" % e)
         v["elapsed"] = round(now - self.job["start"]) if self.job else None
+        ref = self.job and self.job.get("ref")
+        v["job_ref"] = {"x": ref[0] / 1000.0, "y": ref[1] / 1000.0} if ref else None  # head at the start
         j = self.job
         v["not_firing"] = bool(j and self.laser_live and not j["fired"] and j["laser0"] is not None
                                and j["run_s"] >= max(NOT_FIRING_AFTER, 2 * self.laser_gap))
@@ -2221,9 +2274,19 @@ class JobStore:
         try:
             with open(os.path.join(self.path, "index.json")) as f:
                 idx = json.load(f)
-            return [j for j in idx if JOB_ID_RE.match(str(j.get("id"))) and os.path.isfile(self._file(j["id"]))]
+            idx = [j for j in idx if JOB_ID_RE.match(str(j.get("id"))) and os.path.isfile(self._file(j["id"]))]
         except (OSError, ValueError, AttributeError, TypeError):
             return []
+        for j in idx:  # captured by an older version: work out the placement now
+            if "placement" not in j:
+                try:
+                    with open(self._file(j["id"]), "rb") as f:
+                        geo = ruida_job_geometry(f.read())
+                    j.update(absolute=geo["absolute"], placement=geo["placement"],
+                             bounds=list(geo["bounds"]) if geo["bounds"] else None)
+                except OSError:
+                    pass
+        return idx
 
     def _save(self):
         tmp = os.path.join(self.path, "index.json.tmp")
@@ -2236,7 +2299,7 @@ class JobStore:
         geo = ruida_job_geometry(data)
         entry = {"id": jid, "start": start, "end": end, "bytes": len(data), "cuts": job_cuts(data),
                  "complete": complete, "runs": [], "absolute": geo["absolute"],
-                 "bounds": list(geo["bounds"]) if geo["bounds"] else None}
+                 "placement": geo["placement"], "bounds": list(geo["bounds"]) if geo["bounds"] else None}
         with self.lock:
             with open(self._file(jid), "wb") as f:
                 f.write(data)
@@ -3174,9 +3237,10 @@ def make_handler(cam, cfg, dashboard, updater, net=None, laser=None, ruida=None,
                         data = jobs.store.read(str(body.get("job") or "")) if jobs else None
                         if data is None:
                             raise RuidaCommandError("that job isn't stored on the Bridge")
-                        outline = frame_outline(ruida_job_geometry(data), kind)
-                        return self._json(dict(ok=True, points=len(outline),
-                                               **ruida.frame(outline, who=who, label=kind + " frame")))
+                        geo = ruida_job_geometry(data)
+                        outline = frame_outline(geo, kind)
+                        return self._json(dict(ok=True, points=len(outline), **ruida.frame(
+                            outline, who=who, label=kind + " frame", from_head=geo["placement"] == "current")))
                     except RuidaCommandError as e:
                         what = {"/api/laser/origin": "go to origin", "/api/laser/home": "home",
                                 "/api/laser/jog": "move"}.get(p, "frame")

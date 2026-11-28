@@ -32,7 +32,7 @@ def r(v):
 
 def square_job():
     """A 10 x 10 mm square at (10, 20) mm on layer 0 (red), plus a line on layer 1."""
-    return (b"\xD8\x12"                                   # header-ish command, ignored
+    return (b"\xD8\x10"                                   # Start From: Absolute Coords
             + b"\xCA\x06\x00" + a(0x0000FF)               # layer 0 colour: red (COLORREF)
             + b"\xCA\x06\x01" + a(0xFF0000)               # layer 1 colour: blue
             + b"\xCA\x02\x00"                             # layer 0
@@ -339,6 +339,20 @@ def with_header(job, x0, y0, x1, y1):
     return b"\xE7\x03" + a(x0) + a(y0) + b"\xE7\x07" + a(x1) + a(y1) + job
 
 
+def lb(v):
+    """A coordinate the way LightBurn writes it: negative ones as 32-bit two's complement."""
+    return app.encode35(v & 0xFFFFFFFF)
+
+
+def current_position_job(mode=0x12):
+    """Like the RDC6442G capture: Start From Current Position (D8 12), coordinates relative to
+    the head. A 50 x 30 mm rectangle to the left of (-X) and above (+Y) where the head starts."""
+    pts = [(-50000, 0), (-50000, 30000), (0, 30000), (0, 0)]
+    return (bytes((0xD8, mode)) + b"\xE7\x03" + lb(-50000) + lb(0) + b"\xE7\x07" + lb(0) + lb(30000)
+            + b"\xCA\x02\x00" + b"\x88" + lb(0) + lb(0)
+            + b"".join(b"\xA8" + lb(x) + lb(y) for x, y in pts) + b"\xD7")
+
+
 class GeometryTest(unittest.TestCase):
     def test_absolute_job(self):
         g = app.ruida_job_geometry(with_header(square_job(), 10000, 20000, 20000, 30000))
@@ -365,6 +379,40 @@ class GeometryTest(unittest.TestCase):
         with self.assertRaises(app.RuidaCommandError):
             app.frame_outline(app.ruida_job_geometry(b"\xD7"), "box")
 
+    def test_negative_coordinates_from_lightburn(self):
+        self.assertEqual(app.job_coord(lb(-279400)), -279400)  # seen as 0F 7F 6E 79 18
+        self.assertEqual(lb(-279400), bytes.fromhex("0F7F6E7918"))
+        self.assertEqual(app.job_coord(lb(583370)), 583370)
+
+    def test_current_position_job(self):
+        g = app.ruida_job_geometry(current_position_job())
+        self.assertEqual((g["placement"], g["absolute"]), ("current", False))
+        self.assertEqual(g["bounds"], (-50000, 0, 0, 30000))
+        self.assertEqual(app.frame_outline(g, "box"),  # relative to the head; Ruida.frame adds it
+                         [(-50000, 0), (-50000, 30000), (0, 30000), (0, 0), (-50000, 0)])
+
+    def test_user_origin_job_not_framed_yet(self):
+        g = app.ruida_job_geometry(current_position_job(0x11))
+        self.assertEqual(g["placement"], "origin")
+        with self.assertRaises(app.RuidaCommandError):
+            app.frame_outline(g, "box")
+
+    def test_old_captures_get_their_placement(self):
+        tmp = tempfile.mkdtemp()
+        try:
+            st = app.JobStore(tmp)
+            jid = st.add(current_position_job(), 1000.0, 1001.0, True)
+            idx = json.load(open(os.path.join(tmp, "index.json")))
+            for j in idx:  # as written by 3.3 and older
+                del j["placement"]
+                j["bounds"] = [0, 0, 4294917296, 30000]
+            with open(os.path.join(tmp, "index.json"), "w") as f:
+                json.dump(idx, f)
+            j = app.JobStore(tmp).list()[0]
+            self.assertEqual((j["id"], j["placement"], j["bounds"]), (jid, "current", [-50000, 0, 0, 30000]))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
     def test_hull(self):
         pts = [(0, 0), (10, 0), (10, 10), (0, 10), (5, 5), (5, 0)]
         self.assertEqual(app.convex_hull(pts), [(0, 0), (10, 0), (10, 10), (0, 10)])
@@ -389,7 +437,8 @@ class GeometryTest(unittest.TestCase):
             line_free = square_job().split(b"\xCA\x02\x01")[0] + b"\xD7"
             st.add(with_header(line_free, 10000, 20000, 20000, 30000), 1000.0, 1001.0, True)
             j = st.list()[0]
-            self.assertEqual((j["absolute"], j["bounds"]), (True, [10000, 20000, 20000, 30000]))
+            self.assertEqual((j["absolute"], j["placement"], j["bounds"]),
+                             (True, "absolute", [10000, 20000, 20000, 30000]))
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
@@ -414,8 +463,8 @@ class HttpJobsTest(StoreBase):
         test = self
 
         class StubRuida:
-            def frame(self, outline, who="?", label="frame"):
-                test.moves.append((label, outline))
+            def frame(self, outline, who="?", label="frame", from_head=False):
+                test.moves.append((label, outline, from_head))
                 return {"packets": len(outline) + 8, "sent": len(outline) + 8, "seconds": 3.0}
 
             def go_to_origin(self, who="?"):
@@ -507,6 +556,11 @@ class HttpJobsTest(StoreBase):
         self.assertEqual(len(self.moves[-1][1]), 5)
         st, j = self.post("/api/laser/frame", {"job": jid, "kind": "outline"})
         self.assertEqual((st, self.moves[-1][0]), (200, "outline frame"))
+        self.assertFalse(self.moves[-1][2])
+        cur = self.store.add(current_position_job(), 3000.0, 3001.0, True)
+        st, j = self.post("/api/laser/frame", {"job": cur, "kind": "box"})
+        self.assertEqual((st, self.moves[-1][2]), (200, True), j)  # placed from the head
+        self.moves.pop()
         for body in ({"job": rel}, {"job": "nope"}, {"job": jid, "kind": "circle"}):
             st, j = self.post("/api/laser/frame", body)
             self.assertEqual(st, 409, body)
@@ -552,6 +606,12 @@ class DashboardParserTest(unittest.TestCase):
     def test_garbage_does_not_throw(self):
         P = self.run_parser(bytes(range(256)) * 4)
         self.assertIsInstance(P["cuts"], int)
+
+    def test_current_position(self):
+        P = self.run_parser(current_position_job())
+        self.assertEqual(P["placement"], "current")
+        self.assertEqual(P["bounds"], {"minX": -50000, "minY": 0, "maxX": 0, "maxY": 30000})
+        self.assertEqual(self.run_parser(square_job())["placement"], "absolute")
 
 
 if __name__ == "__main__":

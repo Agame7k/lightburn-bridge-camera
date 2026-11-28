@@ -3,6 +3,42 @@
 Versions are the `VERSION` in `lbcam_stream.py` and the name of the update file
 (`lbcam-update-<version>.tar.gz`). Newest first.
 
+## 3.4 (2026-11-27)
+
+- **Current Position jobs** (LightBurn's *Start From: Current Position*) can be framed: the
+  outline is placed from where the head is when you press Frame, like LightBurn does, and refused
+  if any of it would leave the bed. The drawing says "starts where the head is", the head marker
+  sits on the job's origin, and while the job runs it moves relative to where the head started.
+- The Bridge reads how a job is placed from the file itself (`D8 10` absolute, `D8 12` current
+  position, `D8 11` user origin). User Origin jobs are drawn but can't be framed yet.
+- Fixed: negative coordinates in job files (LightBurn writes them as 32-bit numbers) were read as
+  huge positive ones, so Current Position jobs drew wrong. Jobs captured by older versions are
+  re-checked when the Bridge starts.
+
+## 3.3 (2026-11-27)
+
+- **Every page shows when the Bridge is offline.** A red bar across the top: how long since it
+  last answered, a Retry button, and a reminder that a job already on the laser keeps going. The
+  page is greyed out with its buttons disabled (no more stale "Running" that looks live), the
+  Laser pill goes grey, the tab title starts with "⚠ Offline", and a notice pops up. "Bridge back
+  online" when it returns.
+- Says "No network on this device" instead when it's the phone or computer that lost its
+  connection, and "Bridge restarting…" during an update.
+- Status checks give up after 5 s, so a Bridge that hangs is noticed as well as one that's off.
+  Shown after about 6 s without an answer and two failed checks, so one dropped request doesn't
+  trigger it. Checks again as soon as the page comes back to the front.
+
+## 3.2 (2026-11-27)
+
+- **"Machine protected" is shown.** With the door open or a water fault, an RDC6442G takes the
+  job but holds it ("Machine protected, work paused" on its panel). It doesn't report the alarm
+  anywhere readable: the status shows the same bits as a jog (`0x10603`), just with the head
+  still. After 3 s like that (and no move of the Bridge's own), the state is **Held**, with a
+  banner on the monitor page, a notification and a note on the Control page. Stop works while
+  held. Before, this showed as "Moving".
+- Checked on hardware: the door and water inputs are not in the controller's memory
+  (`0x0000`–`0x3FFF`), not sent to LightBurn and not announced; only the hold shows.
+
 ## 3.1 (2026-11-27)
 
 - **Flip X / Flip Y** on the Setup page (*Machine direction*), for machines whose X or Y runs the

@@ -37,7 +37,7 @@ USB camera ─▶ LightBurn Bridge (lbcam, port 8080) ─WiFi─▶ LightBurn "n
   under-voltage. Important ones stay until dismissed; a hidden tab shows a count in its title.
   Optional sound (bell button in the header).
 - **Control page** at `http://<bridge-ip>:8080/control`, made for a phone next to the laser:
-  - big status (Idle / Running / Paused / Moving), progress, head X/Y and the bed size
+  - big status (Idle / Running / Paused / Held / Moving), progress, head X/Y and the bed size
   - jog pad with diagonals, distance (0.1 / 1 / 10 / 50 / 100 mm or any value) and speed,
     like LightBurn's Move window; **Move to** X/Y; **Home** and **Go to origin**
   - the job drawing with **Frame** / **Outline frame**, and recent jobs
@@ -298,7 +298,9 @@ Ruida driver and were checked on an RDC6442G: status bit 0 = job running, bit 1 
 paused; job progress = file progress ÷ file total; the job counter only goes up for finished
 jobs, which is how "finished" and "stopped at N%" are told apart. Jogging from the panel
 doesn't change the status bits, so "Moving" comes from the head position changing; moves
-without a job file don't count as jobs. Hour counters are in seconds, the controller's previous job time in milliseconds. Other
+without a job file don't count as jobs. With the door open or a water fault the controller holds
+a job ("Machine protected" on its panel) at the jog bits `0x10603` with the head still, which is
+shown as **Held**; the door and water inputs themselves can't be read. Hour counters are in seconds, the controller's previous job time in milliseconds. Other
 models may differ; `/api/laser` includes the raw values under `controller.raw` for checking.
 
 Head moves were recorded from LightBurn on an RDC6442G with **Record laser traffic**. Go to
@@ -332,8 +334,11 @@ data). Streams without a single cut (framing, jogging) aren't kept.
 - Turn it off with `LBCAM_JOBS=0` in `/boot/lbcam.env`.
 - **Frame** and **Outline frame** trace the shown job's bounding box or the outline around its
   cuts (its convex hull, like LightBurn's rubber-band frame) at 100 mm/s with laser power set
-  to 0, then return the head to where it was. Only for jobs placed with LightBurn's
-  *Start From: Absolute Coords* (the job header must match its cuts), and only while idle.
+  to 0, then return the head to where it was. Works for LightBurn's *Start From: Absolute Coords*
+  (the job header must match its cuts) and *Current Position* (placed from where the head is
+  when you press Frame, refused if any of it would leave the bed), only while idle. *User Origin*
+  jobs are drawn but can't be framed yet. The job file says which: `D8 10` absolute, `D8 11`
+  user origin, `D8 12` current position.
 - If a job draws wrong, **Download raw** saves exactly what was captured, for a bug report.
 - **Record laser traffic** (setup page) records everything LightBurn and the controller send
   each other for 30 s, decoded into commands. Use it to see what a LightBurn button sends.

@@ -244,6 +244,43 @@ class ReaderTest(unittest.TestCase):
         self.assertEqual(self.r.status()["state"], "idle")
         self.assertIsNone(self.r.status()["last_job"])
 
+    def test_protected_hold(self):
+        # recorded on an RDC6442G: job sent with the door open, panel says "Machine protected,
+        # work paused". Status 0x10603 (the jog bits) for 30 s with the head still.
+        self.ctrl.mem[0x0320] = 6250
+        self.r.poll_once(self.t)
+        self.run_job([(0x10603, 0, None)])
+        self.assertEqual(self.r.status()["state"], "moving")  # too early to tell from a jog
+        self.r.held_since -= app.HELD_AFTER + 1
+        self.r.moved_at = time.time() - app.HELD_AFTER - 1
+        self.run_job([(0x10603, 0, None)])
+        s = self.r.status()
+        self.assertEqual((s["state"], s["held"], s["moving"], s["running"]), ("held", True, False, False))
+        self.ctrl.mem[0x0221] += 20000  # head moves: a jog after all
+        self.run_job([(0x10603, 0, None)])
+        self.assertEqual(self.r.status()["state"], "moving")
+        self.r.moved_at -= 60
+        self.run_job([(0x10600, 0, None)])
+        self.assertEqual(self.r.status()["state"], "idle")
+        self.assertIsNone(self.r.status()["last_job"])  # never ran
+
+    def test_own_moves_are_never_held(self):
+        self.r.poll_once(self.t)
+        self.r.motion_until = time.time() + 60  # a frame of ours, head between moves
+        self.r.moved_at = time.time() - 60
+        self.run_job([(0x10603, 0, None)])
+        self.assertIsNone(self.r.held_since)
+        self.assertEqual(self.r.status()["state"], "moving")
+
+    def test_job_remembers_where_the_head_started(self):
+        self.ctrl.mem[0x0200] = 0x10600
+        self.r.poll_once(self.t)  # idle at (150.5, 80.25)
+        self.ctrl.mem[0x0221] = 140000  # the head has moved a bit by the first running poll
+        self.run_job([(0x10401, 10, None)])
+        self.assertEqual(self.r.status()["job_ref"], {"x": 150.5, "y": 80.25})
+        self.run_job([(0x10600, 0, None)])
+        self.assertIsNone(self.r.status()["job_ref"])
+
     def test_jog_after_a_job_with_stale_file_total(self):
         # the previous job's file total stays readable after the job; bit 0x200 still says "manual"
         self.r.poll_once(self.t)
@@ -464,6 +501,22 @@ class MotionTest(CommandTest):
         for a_, b_ in zip(frame_part, frame_part[1:]):  # no piece longer than MOVE_CHUNK
             self.assertLessEqual(((a_[0] - b_[0]) ** 2 + (a_[1] - b_[1]) ** 2) ** 0.5, app.MOVE_CHUNK + 1)
 
+    def test_current_position_frame_starts_at_the_head(self):
+        # head at (148.845, 186.54) mm; a 50 x 30 mm job to the left of and above it
+        rel = [(-50000, 0), (-50000, 30000), (0, 30000), (0, 0), (-50000, 0)]
+        self.r.frame(rel, from_head=True)
+        targets = [(app.decode35(x[3:8]), app.decode35(x[8:13])) for x in self.ctrl.commands if x[:1] == b"\xD9"]
+        box = [(148845 + x, 186540 + y) for x, y in rel]
+        self.assertEqual([t for t in targets if t in box][:5], box)
+        self.assertEqual(targets[-1], (148845, 186540))  # and back
+
+    def test_current_position_frame_must_stay_on_the_bed(self):
+        n = len(self.ctrl.commands)
+        with self.assertRaises(app.RuidaCommandError) as e:
+            self.r.frame([(-200000, 0), (0, 0)], from_head=True)  # 148.8 - 200 mm < 0
+        self.assertIn("off the bed", str(e.exception))
+        self.assertFalse([x for x in self.ctrl.commands[n:] if x[:1] == b"\xD9"])
+
     def test_moves_are_paced(self):
         # The controller keeps running moves it already has, so never hand it more than a few.
         self.ctrl.move_time = 0.15
@@ -562,6 +615,11 @@ class MotionTest(CommandTest):
     def test_speed_limited(self):
         self.r.jog(dx=1, speed=5000)
         self.assertEqual(self.ctrl.commands[0], app.ruida_speed(app.JOG_SPEED_MAX))
+
+    def test_held_job_can_only_be_stopped(self):
+        self.assertIn("held", app.RUIDA_COMMANDS["stop"][1])
+        self.assertNotIn("held", app.RUIDA_COMMANDS["pause"][1])
+        self.assertNotIn("held", app.RUIDA_COMMANDS["resume"][1])
 
     def test_stop_still_refused_when_nothing_moves(self):
         with self.assertRaises(app.RuidaCommandError):
